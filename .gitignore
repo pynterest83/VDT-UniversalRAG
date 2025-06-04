@@ -179,3 +179,4 @@ data/embedded_chunks.json
 wandb/
 *.pdf
 Vi-Text-VQA
+datasets/
