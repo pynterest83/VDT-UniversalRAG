@@ -180,3 +180,4 @@ wandb/
 *.pdf
 Vi-Text-VQA
 datasets/
+*.crt
