@@ -5,6 +5,7 @@ from typing import List, Dict, Any
 from datetime import datetime
 import os
 from tqdm import tqdm
+import hashlib
 
 
 class ChunkingStrategy(ABC):
@@ -188,6 +189,42 @@ class SimpleTextChunker(ChunkingStrategy):
         return overlap_sentences
 
 
+class NewlineChunker(ChunkingStrategy):
+    def __init__(self, min_words: int = 5):
+        self.min_words = min_words
+    
+    def chunk(self, content: str, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if not content.strip():
+            return []
+        
+        # Split by single newlines to get paragraphs
+        paragraphs = content.split('\n')
+        
+        chunks = []
+        for para in paragraphs:
+            para = para.strip()
+            # Filter out very short paragraphs
+            if para and len(para.split()) >= self.min_words:
+                chunks.append(para)
+        
+        chunk_objects = []
+        for i, chunk_text in enumerate(chunks):
+            chunk_metadata = metadata.copy()
+            chunk_metadata.update({
+                'chunk_index': i,
+                'word_count': len(chunk_text.split()),
+                'char_count': len(chunk_text),
+                'chunk_type': 'newline_paragraph'
+            })
+            
+            chunk_objects.append({
+                'content': chunk_text.strip(),
+                'metadata': chunk_metadata
+            })
+        
+        return chunk_objects
+
+
 class DocumentChunker:
     def __init__(self):
         self.strategies = {
@@ -195,13 +232,16 @@ class DocumentChunker:
             'medical_paragraph_large': MedicalParagraphChunker(min_paragraph_words=30, max_paragraph_words=1200),
             'simple': SimpleTextChunker(),
             'simple_large': SimpleTextChunker(chunk_size=1024, overlap_size=100),
-            'simple_small': SimpleTextChunker(chunk_size=256, overlap_size=25)
+            'simple_small': SimpleTextChunker(chunk_size=256, overlap_size=25),
+            'newline': NewlineChunker(),
+            'newline_no_filter': NewlineChunker(min_words=0)
         }
     
     def add_strategy(self, name: str, strategy: ChunkingStrategy):
         self.strategies[name] = strategy
     
-    def chunk_document(self, document: Dict[str, Any], strategy_name: str = 'medical_paragraph') -> List[Dict[str, Any]]:
+    def chunk_document(self, document: Dict[str, Any], strategy_name: str = 'medical_paragraph', 
+                      document_id: str = None) -> List[Dict[str, Any]]:
         strategy = self.strategies[strategy_name]
         
         base_metadata = {
@@ -214,8 +254,14 @@ class DocumentChunker:
         content = document.get('markdown', '') or document.get('content', '') or document.get('text', '')
         chunks = strategy.chunk(content, base_metadata)
         
+        # Generate unique chunk IDs using document_id
         for i, chunk in enumerate(chunks):
-            chunk['chunk_id'] = f"{strategy_name}_{i:04d}"
+            if document_id:
+                chunk['chunk_id'] = f"{document_id}_{strategy_name}_{i:04d}"
+            else:
+                # Fallback using source URL hash if no document_id provided
+                url_hash = hashlib.md5(document.get('url', '').encode()).hexdigest()[:8]
+                chunk['chunk_id'] = f"{url_hash}_{strategy_name}_{i:04d}"
         
         return chunks
     
@@ -248,10 +294,9 @@ def chunk_documents_from_jsonl(input_path: str = 'text_corpus_youmed_filtered.js
     all_chunks = []
     
     for i, document in enumerate(tqdm(documents, desc="Chunking documents")):
-        chunks = chunker.chunk_document(document, strategy)
+        chunks = chunker.chunk_document(document, strategy, document_id=f"doc_{i:04d}")
         for chunk in chunks:
             chunk['metadata']['document_index'] = i
-            chunk['chunk_id'] = f"doc_{i:04d}_{strategy}_{len(all_chunks):06d}"
         all_chunks.extend(chunks)
     
     chunker.save_chunks(all_chunks, output_path, format)
@@ -261,7 +306,7 @@ def chunk_documents_from_jsonl(input_path: str = 'text_corpus_youmed_filtered.js
 if __name__ == "__main__":
     chunks = chunk_documents_from_jsonl(
         input_path='datasets/text_corpus_youmed_filtered.jsonl',
-        output_path='chunked_medical_documents.jsonl',
-        strategy='medical_paragraph',
+        output_path='datasets/chunked_medical_paragraphs.jsonl',
+        strategy='newline_no_filter',
         format='jsonl'
     )
