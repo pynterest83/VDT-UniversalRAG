@@ -4,27 +4,20 @@ from typing import List, Dict, Any
 from tqdm import tqdm
 from vectorstore import VectorStore
 from ragas import SingleTurnSample
-from ragas.metrics import LLMContextPrecisionWithReference, LLMContextRecall
-from ragas.llms import LangchainLLMWrapper
-from langchain_google_genai import ChatGoogleGenerativeAI
+from ragas.metrics import NonLLMContextPrecisionWithReference, NonLLMContextRecall
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
+os.environ["LANGCHAIN_TRACING_V2"] = "false"
+
 class RAGASBenchmark:
     def __init__(self, vector_store: VectorStore):
         self.vector_store = vector_store
         
-        evaluator_llm = LangchainLLMWrapper(
-            ChatGoogleGenerativeAI(
-                model="gemini-1.5-flash",
-                google_api_key=os.getenv("GEMINI_API_KEY")
-            )
-        )
-        
-        self.context_precision = LLMContextPrecisionWithReference(llm=evaluator_llm)
-        self.context_recall = LLMContextRecall(llm=evaluator_llm)
+        self.context_precision = NonLLMContextPrecisionWithReference()
+        self.context_recall = NonLLMContextRecall()
     
     def load_qa_dataset(self, jsonl_path: str) -> List[Dict[str, Any]]:
         qa_data = []
@@ -49,7 +42,7 @@ class RAGASBenchmark:
         sample = SingleTurnSample(
             user_input=question,
             response=answer,
-            reference=context,
+            reference_contexts=[context],
             retrieved_contexts=retrieved_contexts
         )
         
@@ -109,7 +102,7 @@ async def main():
     
     results = await benchmark.benchmark(
         qa_jsonl_path="datasets/q_a_test_filtered.jsonl",
-        k_values=[5, 20]
+        k_values=[5, 10,20]
     )
     
     print("\n=== RAGAS Benchmark Results ===")
@@ -119,7 +112,7 @@ async def main():
         print(f"  Context Recall: {metrics['context_recall_mean']:.4f}")
         print(f"  Samples: {metrics['samples_evaluated']}")
     
-    with open('ragas_benchmark_results.json', 'w', encoding='utf-8') as f:
+    with open('results/paragraphs_results.json', 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
 if __name__ == "__main__":

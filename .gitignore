@@ -181,3 +181,4 @@ wandb/
 Vi-Text-VQA
 datasets/
 *.crt
+results/
