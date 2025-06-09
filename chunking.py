@@ -64,170 +64,194 @@ class MedicalDocumentChunker:
             section = '## ' + section
             lines = section.split('\n')
             section_title = lines[0].replace('##', '').strip()
+            section_title = re.sub(r'^\d+\.\s*', '', section_title)
             section_content = '\n'.join(lines[1:]).strip()
             
-            subsection_splits = re.split(r'\n(\d+\.\d+(?:\.\d+)?)\.\s+([^\n]+)', section_content)
-            
-            if len(subsection_splits) > 1:
-                chunk_idx = 0
-                i = 1
-                while i < len(subsection_splits):
-                    if i + 2 < len(subsection_splits):
-                        subsection_number = subsection_splits[i]
-                        subsection_title = subsection_splits[i + 1]
-                        raw_content = subsection_splits[i + 2]
-                        
-                        lines = raw_content.split('\n')
-                        content_lines = []
-                        
-                        for line in lines:
-                            line = line.strip()
-                            if line and line != subsection_title and not line.startswith('>>'):
-                                content_lines.append(line)
-                        
-                        clean_content = ' '.join(content_lines).strip()
-                        
-                        if clean_content and len(clean_content.split()) >= 5:
-                            chunk_id = self._generate_chunk_id(url, section_idx, chunk_idx)
-                            chunks.append({
-                                'content': clean_content,
-                                'metadata': {
-                                    'url': url,
-                                    'title': title,
-                                    'section_title': section_title,
-                                    'subsection_number': subsection_number,
-                                    'subsection_title': subsection_title,
-                                    'section_index': section_idx,
-                                    'chunk_index': chunk_idx,
-                                    'word_count': len(clean_content.split()),
-                                    'char_count': len(clean_content),
-                                    'created_at': datetime.now().isoformat(),
-                                    'has_images': False,
-                                    'image_count': 0
-                                },
-                                'chunk_id': chunk_id
-                            })
-                            chunk_idx += 1
-                        
-                        i += 3
-                    else:
-                        break
-            else:
-                lines = section_content.split('\n')
-                content_lines = []
-                
-                for line in lines:
-                    line = line.strip()
-                    if line and not line.startswith('>>'):
-                        content_lines.append(line)
-                
-                clean_content = ' '.join(content_lines).strip()
-                
-                if clean_content and len(clean_content.split()) >= 10:
-                    chunk_id = self._generate_chunk_id(url, section_idx, 0)
-                    chunks.append({
-                        'content': clean_content,
-                        'metadata': {
-                            'url': url,
-                            'title': title,
-                            'section_title': section_title,
-                            'section_index': section_idx,
-                            'chunk_index': 0,
-                            'word_count': len(clean_content.split()),
-                            'char_count': len(clean_content),
-                            'created_at': datetime.now().isoformat(),
-                            'has_images': False,
-                            'image_count': 0
-                        },
-                        'chunk_id': chunk_id
-                    })
+            chunks.extend(self._parse_subsections(section_content, url, title, section_title, section_idx))
         
         return chunks
-
+    
+    def _parse_subsections(self, content: str, url: str, title: str, section_title: str, section_idx: int) -> List[Dict[str, Any]]:
+        chunks = []
+        chunk_idx = 0
+        
+        subsection_pattern = r'\n(\d+(?:\.\d+)*)\.\s+([^\n]+)'
+        subsection_matches = list(re.finditer(subsection_pattern, '\n' + content))
+        
+        if subsection_matches:
+            first_match_start = subsection_matches[0].start() - 1
+            if first_match_start > 0:
+                pre_content = content[:first_match_start].strip()
+                if pre_content and len(pre_content.split()) >= 5:
+                    clean_content = self._clean_content(pre_content)
+                    if clean_content:
+                        chunk_id = self._generate_chunk_id(url, section_idx, chunk_idx)
+                        chunks.append(self._create_chunk(
+                            clean_content, url, title, section_title, None, None, 
+                            section_idx, chunk_idx, chunk_id
+                        ))
+                        chunk_idx += 1
+            
+            for i, match in enumerate(subsection_matches):
+                subsection_number = match.group(1)
+                subsection_title = match.group(2).strip()
+                
+                start_pos = match.end() - 1
+                if i + 1 < len(subsection_matches):
+                    end_pos = subsection_matches[i + 1].start() - 1
+                    raw_content = content[start_pos:end_pos]
+                else:
+                    raw_content = content[start_pos:]
+                
+                clean_content = self._clean_subsection_content(raw_content, subsection_title)
+                
+                if clean_content and len(clean_content.split()) >= 3:
+                    chunk_id = self._generate_chunk_id(url, section_idx, chunk_idx)
+                    chunks.append(self._create_chunk(
+                        clean_content, url, title, section_title, subsection_number, 
+                        subsection_title, section_idx, chunk_idx, chunk_id
+                    ))
+                    chunk_idx += 1
+        else:
+            clean_content = self._clean_content(content)
+            if clean_content and len(clean_content.split()) >= 10:
+                chunk_id = self._generate_chunk_id(url, section_idx, 0)
+                chunks.append(self._create_chunk(
+                    clean_content, url, title, section_title, None, None,
+                    section_idx, 0, chunk_id
+                ))
+        
+        return chunks
+    
+    def _clean_subsection_content(self, content: str, subsection_title: str) -> str:
+        lines = content.split('\n')
+        content_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if (line and 
+                not line.startswith('>>') and
+                line != subsection_title and
+                not re.match(r'^\d+(?:\.\d+)*\.\s+' + re.escape(subsection_title) + r'\s*$', line)):
+                content_lines.append(line)
+        
+        return ' '.join(content_lines).strip()
+    
+    def _clean_content(self, content: str) -> str:
+        lines = content.split('\n')
+        content_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith('>>'):
+                content_lines.append(line)
+        
+        return ' '.join(content_lines).strip()
+    
+    def _create_chunk(self, content: str, url: str, title: str, section_title: str, 
+                     subsection_number: str, subsection_title: str, 
+                     section_idx: int, chunk_idx: int, chunk_id: str) -> Dict[str, Any]:
+        metadata = {
+            'url': url,
+            'title': title,
+            'section_title': section_title,
+            'section_index': section_idx,
+            'chunk_index': chunk_idx,
+            'word_count': len(content.split()),
+            'char_count': len(content),
+            'created_at': datetime.now().isoformat(),
+            'has_images': False,
+            'image_count': 0
+        }
+        
+        if subsection_number and subsection_title:
+            metadata['subsection_number'] = subsection_number
+            metadata['subsection_title'] = subsection_title
+        
+        return {
+            'content': content,
+            'metadata': metadata,
+            'chunk_id': chunk_id
+        }
+    
     def _generate_chunk_id(self, url: str, section_idx: int, chunk_idx: int) -> str:
         url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
         timestamp = int(datetime.now().timestamp() * 1000) % 10000
         return f"{url_hash}_{section_idx}_{chunk_idx}_{timestamp}"
     
     def extract_images_from_url(self, url: str) -> List[Dict[str, Any]]:
-        try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            response = requests.get(url, headers=headers, timeout=15)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            main_content = soup.select_one('.prose.max-w-none')
-            
-            if not main_content:
-                return []
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
         
-            images = []
-            figures = main_content.find_all("figure")
-            
-            for figure in figures:
-                img_element = figure.find("img")
-                if img_element:
-                    img_src = img_element.get('src') or img_element.get('data-src')
-                    if img_src and "data:image" not in img_src:
-                        if not img_src.startswith('http'):
-                            img_src = urljoin(url, img_src)
-                        
-                        caption = ""
-                        figcaption = figure.find("figcaption")
-                        if figcaption:
-                            caption = figcaption.get_text(strip=True)
-                        
-                        image_data = self.download_image(
-                            img_src, url,
-                            img_element.get('alt', ''),
-                            img_element.get('title', ''),
-                            caption
-                        )
-                        
-                        if image_data:
-                            images.append(image_data)
-            
-            return images
-        except:
+        soup = BeautifulSoup(response.content, 'html.parser')
+        main_content = soup.select_one('.prose.max-w-none')
+        
+        if not main_content:
             return []
+    
+        images = []
+        figures = main_content.find_all("figure")
+        
+        for figure in figures:
+            img_element = figure.find("img")
+            if img_element:
+                img_src = img_element.get('src') or img_element.get('data-src')
+                if img_src and "data:image" not in img_src:
+                    if not img_src.startswith('http'):
+                        img_src = urljoin(url, img_src)
+                    
+                    caption = ""
+                    figcaption = figure.find("figcaption")
+                    if figcaption:
+                        caption = figcaption.get_text(strip=True)
+                    
+                    image_data = self.download_image(
+                        img_src, url,
+                        img_element.get('alt', ''),
+                        img_element.get('title', ''),
+                        caption
+                    )
+                    
+                    if image_data:
+                        images.append(image_data)
+        
+        return images
         
     def download_image(self, img_src: str, source_url: str, 
                       alt_text: str, title: str, caption: str) -> Dict[str, Any]:
-        try:
-            filename = self.sanitize_filename(source_url, img_src)
-            filepath = os.path.join(self.images_dir, filename)
+        filename = self.sanitize_filename(source_url, img_src)
+        filepath = os.path.join(self.images_dir, filename)
+        
+        if os.path.exists(filepath):
+            with open(filepath, 'rb') as f:
+                content = f.read()
+            image_hash = hashlib.md5(content).hexdigest()
+        else:
+            response = requests.get(img_src, timeout=15)
+            response.raise_for_status()
             
-            if os.path.exists(filepath):
-                with open(filepath, 'rb') as f:
-                    content = f.read()
-                image_hash = hashlib.md5(content).hexdigest()
-            else:
-                response = requests.get(img_src, timeout=15)
-                response.raise_for_status()
-                
-                if len(response.content) < self.MIN_IMAGE_SIZE or len(response.content) > self.MAX_IMAGE_SIZE:
-                    return None
-                
-                with open(filepath, "wb") as file:
-                    file.write(response.content)
-                
-                image_hash = hashlib.md5(response.content).hexdigest()
+            if len(response.content) < self.MIN_IMAGE_SIZE or len(response.content) > self.MAX_IMAGE_SIZE:
+                return None
             
-            return {
-                'filename': filename,
-                'filepath': filepath,
-                'source_url': source_url,
-                'image_url': img_src,
-                'alt_text': alt_text,
-                'title': title,
-                'caption': caption,
-                'file_size': os.path.getsize(filepath),
-                'image_hash': image_hash
-            }
-        except:
-            return None
+            with open(filepath, "wb") as file:
+                file.write(response.content)
+            
+            image_hash = hashlib.md5(response.content).hexdigest()
+        
+        return {
+            'filename': filename,
+            'filepath': filepath,
+            'source_url': source_url,
+            'image_url': img_src,
+            'alt_text': alt_text,
+            'title': title,
+            'caption': caption,
+            'file_size': os.path.getsize(filepath),
+            'image_hash': image_hash
+        }
     
     def sanitize_filename(self, url: str, img_src: str) -> str:
         domain = urlparse(url).netloc.replace('.', '_')
@@ -299,13 +323,9 @@ class MedicalDocumentChunker:
             
             with tqdm(total=len(documents), desc="Processing medical documents") as pbar:
                 for future in concurrent.futures.as_completed(future_to_doc):
-                    try:
-                        chunks, images = future.result()
-                        all_chunks.extend(chunks)
-                        all_images.extend(images)
-                    except:
-                        pass
-                    
+                    chunks, images = future.result()
+                    all_chunks.extend(chunks)
+                    all_images.extend(images)
                     pbar.update(1)
                     time.sleep(0.1)
         
