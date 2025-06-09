@@ -1,312 +1,357 @@
 import json
 import re
-from abc import ABC, abstractmethod
-from typing import List, Dict, Any
-from datetime import datetime
+import requests
+from bs4 import BeautifulSoup
 import os
-from tqdm import tqdm
 import hashlib
+import concurrent.futures
+from tqdm import tqdm
+import time
+from urllib.parse import urljoin, urlparse
+from datetime import datetime
+from typing import List, Dict, Any
 
-
-class ChunkingStrategy(ABC):
-    @abstractmethod
-    def chunk(self, content: str, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
-        pass
-
-
-class MedicalParagraphChunker(ChunkingStrategy):
-    def __init__(self, min_paragraph_words: int = 50, max_paragraph_words: int = 800):
-        self.min_paragraph_words = min_paragraph_words
-        self.max_paragraph_words = max_paragraph_words
+class MedicalDocumentChunker:
+    def __init__(self, 
+                 images_dir: str = 'datasets/images',
+                 max_workers: int = 5):
+        self.images_dir = images_dir
+        self.max_workers = max_workers
+        os.makedirs(self.images_dir, exist_ok=True)
+        
+        self.MAX_IMAGE_SIZE = 10 * 1024 * 1024
+        self.MIN_IMAGE_SIZE = 1024
     
-    def chunk(self, content: str, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
-        if not content.strip():
-            return []
-        
-        content = self._preprocess_medical_content(content)
-        paragraphs = self._extract_paragraphs(content)
-        chunks = self._process_paragraphs(paragraphs)
-        
-        chunk_objects = []
-        for i, chunk_text in enumerate(chunks):
-            chunk_metadata = metadata.copy()
-            chunk_metadata.update({
-                'chunk_index': i,
-                'word_count': len(chunk_text.split()),
-                'char_count': len(chunk_text),
-                'chunk_type': 'medical_paragraph'
-            })
-            
-            chunk_objects.append({
-                'content': chunk_text.strip(),
-                'metadata': chunk_metadata
-            })
-        
-        return chunk_objects
+    def load_documents(self, input_path: str) -> List[Dict[str, Any]]:
+        documents = []
+        with open(input_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    documents.append(json.loads(line))
+        return documents
     
-    def _preprocess_medical_content(self, content: str) -> str:
-        # Remove HTML tags
-        content = re.sub(r'<[^>]+>', '', content)
-        
-        # Remove URLs and links
-        content = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', content)
-        content = re.sub(r'www\.(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', content)
-        
-        # Remove non-medical promotional content patterns
-        content = re.sub(r'(subscribe|follow us|like us|share|comment below|click here)', '', content, flags=re.IGNORECASE)
-        
-        # Clean excessive whitespace but preserve paragraph structure
-        content = re.sub(r'\n\s*\n\s*\n+', '\n\n', content)
-        content = re.sub(r'[ \t]+', ' ', content)
-        
-        return content.strip()
-    
-    def _extract_paragraphs(self, content: str) -> List[str]:
-        # Split by double newlines to respect article structure
-        paragraphs = content.split('\n\n')
-        
-        # Clean and filter paragraphs
-        cleaned_paragraphs = []
-        for para in paragraphs:
-            para = para.strip()
-            if para and len(para.split()) >= self.min_paragraph_words:
-                cleaned_paragraphs.append(para)
-        
-        return cleaned_paragraphs
-    
-    def _process_paragraphs(self, paragraphs: List[str]) -> List[str]:
+    def extract_chunks_from_markdown(self, markdown_text: str, title: str, url: str) -> List[Dict[str, Any]]:
         chunks = []
+        main_sections = re.split(r'\n## ', markdown_text)
         
-        for para in paragraphs:
-            word_count = len(para.split())
-            
-            if word_count <= self.max_paragraph_words:
-                # Paragraph fits as single chunk
-                chunks.append(para)
-            else:
-                # Split large paragraphs at sentence boundaries
-                sentences = re.split(r'(?<=[.!?])\s+', para)
-                current_chunk = ""
-                
-                for sentence in sentences:
-                    potential_chunk = current_chunk + " " + sentence if current_chunk else sentence
-                    
-                    if len(potential_chunk.split()) <= self.max_paragraph_words:
-                        current_chunk = potential_chunk
-                    else:
-                        if current_chunk:
-                            chunks.append(current_chunk.strip())
-                        current_chunk = sentence
-                
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
+        if main_sections[0].startswith('#'):
+            intro_content = re.sub(r'^#[^#\n]*\n+', '', main_sections[0]).strip()
+            if intro_content and len(intro_content.split()) >= 10:
+                chunk_id = self._generate_chunk_id(url, 0, 0)
+                chunks.append({
+                    'content': intro_content,
+                    'metadata': {
+                        'url': url,
+                        'title': title,
+                        'section_title': 'Giới thiệu',
+                        'section_index': 0,
+                        'chunk_index': 0,
+                        'word_count': len(intro_content.split()),
+                        'char_count': len(intro_content),
+                        'created_at': datetime.now().isoformat(),
+                        'has_images': False,
+                        'image_count': 0
+                    },
+                    'chunk_id': chunk_id
+                })
+            main_sections = main_sections[1:]
         
-        return chunks
-
-
-class SimpleTextChunker(ChunkingStrategy):
-    def __init__(self, chunk_size: int = 512, overlap_size: int = 50):
-        self.chunk_size = chunk_size
-        self.overlap_size = overlap_size
-    
-    def chunk(self, content: str, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
-        if not content.strip():
-            return []
-        
-        content = self._clean_content(content)
-        sentences = self._split_into_sentences(content)
-        chunks = self._group_sentences_into_chunks(sentences)
-        
-        chunk_objects = []
-        for i, chunk_text in enumerate(chunks):
-            chunk_metadata = metadata.copy()
-            chunk_metadata.update({
-                'chunk_index': i,
-                'word_count': len(chunk_text.split()),
-                'char_count': len(chunk_text)
-            })
-            
-            chunk_objects.append({
-                'content': chunk_text.strip(),
-                'metadata': chunk_metadata
-            })
-        
-        return chunk_objects
-    
-    def _clean_content(self, content: str) -> str:
-        content = re.sub(r'\n\s*\n', '\n\n', content)
-        content = re.sub(r'[ \t]+', ' ', content)
-        return content.strip()
-    
-    def _split_into_sentences(self, content: str) -> List[str]:
-        sentences = re.split(r'(?<=[.!?])\s+', content)
-        return [s.strip() for s in sentences if s.strip()]
-    
-    def _group_sentences_into_chunks(self, sentences: List[str]) -> List[str]:
-        if not sentences:
-            return []
-        
-        chunks = []
-        current_chunk = []
-        current_word_count = 0
-        
-        i = 0
-        while i < len(sentences):
-            sentence = sentences[i]
-            sentence_words = len(sentence.split())
-            
-            if current_chunk and current_word_count + sentence_words > self.chunk_size:
-                chunks.append(' '.join(current_chunk))
-                overlap_chunk = self._get_overlap_text(current_chunk)
-                current_chunk = overlap_chunk
-                current_word_count = sum(len(s.split()) for s in current_chunk)
+        for section_idx, section in enumerate(main_sections, 1):
+            if not section.strip():
                 continue
-            else:
-                current_chunk.append(sentence)
-                current_word_count += sentence_words
-                i += 1
-        
-        if current_chunk:
-            chunks.append(' '.join(current_chunk))
-        
-        return chunks
-    
-    def _get_overlap_text(self, sentences: List[str]) -> List[str]:
-        if not sentences or self.overlap_size <= 0:
-            return []
-        
-        overlap_sentences = []
-        word_count = 0
-        
-        for sentence in reversed(sentences):
-            sentence_words = len(sentence.split())
-            if word_count + sentence_words <= self.overlap_size:
-                overlap_sentences.insert(0, sentence)
-                word_count += sentence_words
-            else:
-                break
-        
-        return overlap_sentences
-
-
-class NewlineChunker(ChunkingStrategy):
-    def __init__(self, min_words: int = 5):
-        self.min_words = min_words
-    
-    def chunk(self, content: str, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
-        if not content.strip():
-            return []
-        
-        # Split by single newlines to get paragraphs
-        paragraphs = content.split('\n')
-        
-        chunks = []
-        for para in paragraphs:
-            para = para.strip()
-            # Filter out very short paragraphs
-            if para and len(para.split()) >= self.min_words:
-                chunks.append(para)
-        
-        chunk_objects = []
-        for i, chunk_text in enumerate(chunks):
-            chunk_metadata = metadata.copy()
-            chunk_metadata.update({
-                'chunk_index': i,
-                'word_count': len(chunk_text.split()),
-                'char_count': len(chunk_text),
-                'chunk_type': 'newline_paragraph'
-            })
+                
+            section = '## ' + section
+            lines = section.split('\n')
+            section_title = lines[0].replace('##', '').strip()
+            section_content = '\n'.join(lines[1:]).strip()
             
-            chunk_objects.append({
-                'content': chunk_text.strip(),
-                'metadata': chunk_metadata
-            })
-        
-        return chunk_objects
-
-
-class DocumentChunker:
-    def __init__(self):
-        self.strategies = {
-            'medical_paragraph': MedicalParagraphChunker(),
-            'medical_paragraph_large': MedicalParagraphChunker(min_paragraph_words=30, max_paragraph_words=1200),
-            'simple': SimpleTextChunker(),
-            'simple_large': SimpleTextChunker(chunk_size=1024, overlap_size=100),
-            'simple_small': SimpleTextChunker(chunk_size=256, overlap_size=25),
-            'newline': NewlineChunker(),
-            'newline_no_filter': NewlineChunker(min_words=0)
-        }
-    
-    def add_strategy(self, name: str, strategy: ChunkingStrategy):
-        self.strategies[name] = strategy
-    
-    def chunk_document(self, document: Dict[str, Any], strategy_name: str = 'medical_paragraph', 
-                      document_id: str = None) -> List[Dict[str, Any]]:
-        strategy = self.strategies[strategy_name]
-        
-        base_metadata = {
-            'source_url': document.get('url', ''),
-            'document_title': document.get('title', ''),
-            'chunking_strategy': strategy_name,
-            'chunked_at': datetime.now().isoformat()
-        }
-        
-        content = document.get('markdown', '') or document.get('content', '') or document.get('text', '')
-        chunks = strategy.chunk(content, base_metadata)
-        
-        # Generate unique chunk IDs using document_id
-        for i, chunk in enumerate(chunks):
-            if document_id:
-                chunk['chunk_id'] = f"{document_id}_{strategy_name}_{i:04d}"
+            subsection_splits = re.split(r'\n(\d+\.\d+(?:\.\d+)?)\.\s+([^\n]+)', section_content)
+            
+            if len(subsection_splits) > 1:
+                chunk_idx = 0
+                i = 1
+                while i < len(subsection_splits):
+                    if i + 2 < len(subsection_splits):
+                        subsection_number = subsection_splits[i]
+                        subsection_title = subsection_splits[i + 1]
+                        raw_content = subsection_splits[i + 2]
+                        
+                        lines = raw_content.split('\n')
+                        content_lines = []
+                        
+                        for line in lines:
+                            line = line.strip()
+                            if line and line != subsection_title and not line.startswith('>>'):
+                                content_lines.append(line)
+                        
+                        clean_content = ' '.join(content_lines).strip()
+                        
+                        if clean_content and len(clean_content.split()) >= 5:
+                            chunk_id = self._generate_chunk_id(url, section_idx, chunk_idx)
+                            chunks.append({
+                                'content': clean_content,
+                                'metadata': {
+                                    'url': url,
+                                    'title': title,
+                                    'section_title': section_title,
+                                    'subsection_number': subsection_number,
+                                    'subsection_title': subsection_title,
+                                    'section_index': section_idx,
+                                    'chunk_index': chunk_idx,
+                                    'word_count': len(clean_content.split()),
+                                    'char_count': len(clean_content),
+                                    'created_at': datetime.now().isoformat(),
+                                    'has_images': False,
+                                    'image_count': 0
+                                },
+                                'chunk_id': chunk_id
+                            })
+                            chunk_idx += 1
+                        
+                        i += 3
+                    else:
+                        break
             else:
-                # Fallback using source URL hash if no document_id provided
-                url_hash = hashlib.md5(document.get('url', '').encode()).hexdigest()[:8]
-                chunk['chunk_id'] = f"{url_hash}_{strategy_name}_{i:04d}"
+                lines = section_content.split('\n')
+                content_lines = []
+                
+                for line in lines:
+                    line = line.strip()
+                    if line and not line.startswith('>>'):
+                        content_lines.append(line)
+                
+                clean_content = ' '.join(content_lines).strip()
+                
+                if clean_content and len(clean_content.split()) >= 10:
+                    chunk_id = self._generate_chunk_id(url, section_idx, 0)
+                    chunks.append({
+                        'content': clean_content,
+                        'metadata': {
+                            'url': url,
+                            'title': title,
+                            'section_title': section_title,
+                            'section_index': section_idx,
+                            'chunk_index': 0,
+                            'word_count': len(clean_content.split()),
+                            'char_count': len(clean_content),
+                            'created_at': datetime.now().isoformat(),
+                            'has_images': False,
+                            'image_count': 0
+                        },
+                        'chunk_id': chunk_id
+                    })
         
         return chunks
+
+    def _generate_chunk_id(self, url: str, section_idx: int, chunk_idx: int) -> str:
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+        timestamp = int(datetime.now().timestamp() * 1000) % 10000
+        return f"{url_hash}_{section_idx}_{chunk_idx}_{timestamp}"
     
-    def save_chunks(self, chunks: List[Dict[str, Any]], output_path: str, format: str = 'jsonl'):
-        if format.lower() == 'json':
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(chunks, f, ensure_ascii=False, indent=2)
-        elif format.lower() == 'jsonl':
-            with open(output_path, 'w', encoding='utf-8') as f:
-                for chunk in chunks:
-                    f.write(json.dumps(chunk, ensure_ascii=False) + '\n')
-
-
-def load_documents_from_jsonl(input_path: str) -> List[Dict[str, Any]]:
-    documents = []
-    with open(input_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                documents.append(json.loads(line))
-    return documents
-
-
-def chunk_documents_from_jsonl(input_path: str = 'text_corpus_youmed_filtered.jsonl',
-                              output_path: str = 'chunked_documents.jsonl',
-                              strategy: str = 'medical_paragraph',
-                              format: str = 'jsonl') -> List[Dict[str, Any]]:
-    documents = load_documents_from_jsonl(input_path)
-    chunker = DocumentChunker()
-    all_chunks = []
+    def extract_images_from_url(self, url: str) -> List[Dict[str, Any]]:
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            main_content = soup.select_one('.prose.max-w-none')
+            
+            if not main_content:
+                return []
+        
+            images = []
+            figures = main_content.find_all("figure")
+            
+            for figure in figures:
+                img_element = figure.find("img")
+                if img_element:
+                    img_src = img_element.get('src') or img_element.get('data-src')
+                    if img_src and "data:image" not in img_src:
+                        if not img_src.startswith('http'):
+                            img_src = urljoin(url, img_src)
+                        
+                        caption = ""
+                        figcaption = figure.find("figcaption")
+                        if figcaption:
+                            caption = figcaption.get_text(strip=True)
+                        
+                        image_data = self.download_image(
+                            img_src, url,
+                            img_element.get('alt', ''),
+                            img_element.get('title', ''),
+                            caption
+                        )
+                        
+                        if image_data:
+                            images.append(image_data)
+            
+            return images
+        except:
+            return []
+        
+    def download_image(self, img_src: str, source_url: str, 
+                      alt_text: str, title: str, caption: str) -> Dict[str, Any]:
+        try:
+            filename = self.sanitize_filename(source_url, img_src)
+            filepath = os.path.join(self.images_dir, filename)
+            
+            if os.path.exists(filepath):
+                with open(filepath, 'rb') as f:
+                    content = f.read()
+                image_hash = hashlib.md5(content).hexdigest()
+            else:
+                response = requests.get(img_src, timeout=15)
+                response.raise_for_status()
+                
+                if len(response.content) < self.MIN_IMAGE_SIZE or len(response.content) > self.MAX_IMAGE_SIZE:
+                    return None
+                
+                with open(filepath, "wb") as file:
+                    file.write(response.content)
+                
+                image_hash = hashlib.md5(response.content).hexdigest()
+            
+            return {
+                'filename': filename,
+                'filepath': filepath,
+                'source_url': source_url,
+                'image_url': img_src,
+                'alt_text': alt_text,
+                'title': title,
+                'caption': caption,
+                'file_size': os.path.getsize(filepath),
+                'image_hash': image_hash
+            }
+        except:
+            return None
     
-    for i, document in enumerate(tqdm(documents, desc="Chunking documents")):
-        chunks = chunker.chunk_document(document, strategy, document_id=f"doc_{i:04d}")
+    def sanitize_filename(self, url: str, img_src: str) -> str:
+        domain = urlparse(url).netloc.replace('.', '_')
+        filename = img_src.split('/')[-1]
+        if not filename or '.' not in filename:
+            filename = hashlib.md5(img_src.encode()).hexdigest()[:12] + '.jpg'
+        return f"{domain}_{filename}"
+    
+    def associate_images_with_chunks(self, chunks: List[Dict[str, Any]], 
+                                   images: List[Dict[str, Any]]) -> None:
+        if not images:
+            return
+        
+        sections = {}
         for chunk in chunks:
-            chunk['metadata']['document_index'] = i
-        all_chunks.extend(chunks)
+            section_idx = chunk['metadata']['section_index']
+            if section_idx not in sections:
+                sections[section_idx] = []
+            sections[section_idx].append(chunk)
+        
+        if not sections:
+            return
+            
+        images_per_section = len(images) // len(sections)
+        remaining_images = len(images) % len(sections)
+        
+        image_idx = 0
+        for section_idx in sorted(sections.keys()):
+            section_chunks = sections[section_idx]
+            images_for_section = images_per_section
+            if remaining_images > 0:
+                images_for_section += 1
+                remaining_images -= 1
+            
+            if section_chunks and image_idx < len(images):
+                target_chunk = section_chunks[0]
+                chunk_id = target_chunk['chunk_id']
+                
+                for i in range(min(images_for_section, len(images) - image_idx)):
+                    if image_idx + i < len(images):
+                        images[image_idx + i]['chunk_id'] = chunk_id
+                
+                target_chunk['metadata']['has_images'] = True
+                target_chunk['metadata']['image_count'] = min(images_for_section, len(images) - image_idx)
+                
+                image_idx += images_for_section
     
-    chunker.save_chunks(all_chunks, output_path, format)
-    return all_chunks
+    def process_document(self, document: Dict[str, Any]) -> tuple:
+        url = document['url']
+        title = document['title']
+        markdown = document['markdown']
+        
+        chunks = self.extract_chunks_from_markdown(markdown, title, url)
+        images = self.extract_images_from_url(url)
+        self.associate_images_with_chunks(chunks, images)
+        
+        return chunks, images
+    
+    def process_documents(self, input_path: str, 
+                         chunks_output: str = 'datasets/chunked_medical_paragraphs.jsonl',
+                         images_output: str = 'datasets/image_metadata.jsonl') -> tuple:
+        documents = self.load_documents(input_path)
+        
+        all_chunks = []
+        all_images = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_doc = {executor.submit(self.process_document, doc): doc for doc in documents}
+            
+            with tqdm(total=len(documents), desc="Processing medical documents") as pbar:
+                for future in concurrent.futures.as_completed(future_to_doc):
+                    try:
+                        chunks, images = future.result()
+                        all_chunks.extend(chunks)
+                        all_images.extend(images)
+                    except:
+                        pass
+                    
+                    pbar.update(1)
+                    time.sleep(0.1)
+        
+        with open(chunks_output, 'w', encoding='utf-8') as f:
+            for chunk in all_chunks:
+                f.write(json.dumps(chunk, ensure_ascii=False) + '\n')
+        
+        with open(images_output, 'w', encoding='utf-8') as f:
+            for img in all_images:
+                f.write(json.dumps(img, ensure_ascii=False) + '\n')
+        
+        chunks_with_images = sum(1 for chunk in all_chunks if chunk['metadata']['has_images'])
+        chunks_without_images = len(all_chunks) - chunks_with_images
+        
+        summary = {
+            'total_documents': len(documents),
+            'total_chunks': len(all_chunks),
+            'chunks_with_images': chunks_with_images,
+            'chunks_without_images': chunks_without_images,
+            'total_images': len(all_images),
+            'unique_images': len(set(img['image_hash'] for img in all_images)),
+            'avg_chunks_per_doc': len(all_chunks) / len(documents) if documents else 0,
+            'avg_words_per_chunk': sum(chunk['metadata']['word_count'] for chunk in all_chunks) / len(all_chunks) if all_chunks else 0,
+            'processing_timestamp': datetime.now().isoformat()
+        }
+        
+        with open('datasets/chunking_summary.json', 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        
+        return all_chunks, all_images
+
+
+def main():
+    chunker = MedicalDocumentChunker(
+        images_dir='datasets/images',
+        max_workers=3
+    )
+    
+    chunks, images = chunker.process_documents(
+        input_path='datasets/text_corpus_youmed_filtered.jsonl',
+        chunks_output='datasets/chunked_medical_paragraphs.jsonl',
+        images_output='datasets/image_metadata.jsonl'
+    )
+    
+    return chunks, images
 
 
 if __name__ == "__main__":
-    chunks = chunk_documents_from_jsonl(
-        input_path='datasets/text_corpus_youmed_filtered.jsonl',
-        output_path='datasets/chunked_medical_paragraphs.jsonl',
-        strategy='newline_no_filter',
-        format='jsonl'
-    )
+    chunks, images = main()
