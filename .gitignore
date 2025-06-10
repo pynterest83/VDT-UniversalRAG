@@ -182,3 +182,4 @@ Vi-Text-VQA
 datasets/
 *.crt
 results/
+bge_m3_v1/

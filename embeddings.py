@@ -98,10 +98,9 @@ def finetune_embeddings(
     matryoshka_dimensions = [1024, 768, 512, 256, 128, 64]
     
     print("Loading BGE-M3 model...")
-    # Load model with Flash Attention 2 for efficiency
+    # Load model without Flash Attention for baseline comparison
     model = SentenceTransformer(
         BASE_MODEL,
-        model_kwargs={"attn_implementation": "sdpa"},
         model_card_data=SentenceTransformerModelCardData(
             language="vi",
             license="apache-2.0",
@@ -161,13 +160,37 @@ def finetune_embeddings(
     print(f"Number of corpus documents: {len(corpus)}")
     print(f"Number of relevant docs mappings: {len(relevant_docs)}")
     
-    # SKIP baseline evaluation to save memory for training
+    # Run baseline evaluation before training
     print("\n" + "="*50)
-    print("SKIPPING BASELINE EVALUATION - SAVING MEMORY FOR TRAINING")
+    print("BASELINE EVALUATION (Before Training)")
     print("="*50)
     
-    # Create dummy baseline results for comparison later
-    baseline_results = {f"dim_{dim}_cosine_ndcg@10": 0.0 for dim in matryoshka_dimensions}
+    # Create evaluators for baseline evaluation and training monitoring
+    matryoshka_evaluators = []
+    for dim in matryoshka_dimensions:
+        ir_evaluator = InformationRetrievalEvaluator(
+            queries=queries,
+            corpus=corpus,
+            relevant_docs=relevant_docs,
+            name=f"dim_{dim}",
+            truncate_dim=dim,
+            score_functions={"cosine": cos_sim},
+            show_progress_bar=True,
+            batch_size=32,
+        )
+        matryoshka_evaluators.append(ir_evaluator)
+    
+    evaluator = SequentialEvaluator(matryoshka_evaluators)
+    baseline_results = evaluator(model)
+    
+    print("Baseline Results:")
+    for dim in matryoshka_dimensions:
+        key = f"dim_{dim}_cosine_ndcg@10"
+        print(f"{key}: {baseline_results[key]:.4f}")
+    
+    # Clear GPU cache after baseline evaluation
+    torch.cuda.empty_cache()
+    print("GPU memory cleared after baseline evaluation")
     
     # Clear any existing GPU cache
     torch.cuda.empty_cache()
@@ -194,26 +217,24 @@ def finetune_embeddings(
         bf16=True,                                  
         gradient_checkpointing=True,                
         batch_sampler=BatchSamplers.NO_DUPLICATES,  
-        eval_strategy="steps",                      # Re-enable validation evaluation
-        eval_steps=500,                             # Evaluate every 500 steps
-        save_strategy="steps",                      
-        save_steps=500,                             
+        eval_strategy="epoch",                                               
+        save_strategy="epoch",                      
         logging_steps=50,                           
         save_total_limit=3,                         
-        load_best_model_at_end=True,                # Load best model based on validation
-        metric_for_best_model="eval_loss",          # Use validation loss (memory efficient)
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_dim_1024_cosine_ndcg@10",
         dataloader_num_workers=4,                   
         dataloader_pin_memory=False,                
     )
 
-    # Create trainer with validation dataset
+    # Create trainer with validation dataset and evaluator
     trainer = SentenceTransformerTrainer(
         model=model,
         args=args,
         train_dataset=train_dataset.select_columns(["anchor", "positive"]),
         eval_dataset=validation_dataset.select_columns(["anchor", "positive"]),
         loss=train_loss,
-        evaluator=None,
+        evaluator=evaluator,
     )
     
     try:
