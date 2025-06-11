@@ -24,7 +24,8 @@ image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "accelerate",
     "scikit-learn",
     "scipy",
-).add_local_dir("datasets", "/datasets")  # Add datasets directory to image
+    "tqdm",
+).add_local_dir("datasets", "/datasets", ignore=["images/*", "corpus/*"])  # Add datasets directory to image
 
 app = modal.App(name="bge-m3-medical-embeddings", image=image)
 output_vol = modal.Volume.from_name("embeddings-volume", create_if_missing=True)
@@ -556,3 +557,63 @@ def run_complete_workflow(num_train_epochs: int = 4):
         "training": training_results,
         "evaluation": evaluation_results
     }
+
+@app.function(
+    gpu="A10G", 
+    volumes={VOL_MOUNT_PATH: output_vol}, 
+    timeout=21600  # 6 hours timeout - this was the main issue
+)
+def embed_chunked_corpus(dimension: int = 1024):
+    import json
+    from sentence_transformers import SentenceTransformer
+    from tqdm import tqdm
+    
+    model = SentenceTransformer(
+        str(VOL_MOUNT_PATH / "bge-m3-medical" / "checkpoint-780"),
+        device="cuda"
+    )
+    
+    input_file = "/datasets/chunks/context_corpus.jsonl"
+    output_file = str(VOL_MOUNT_PATH / "context_corpus_embedded.jsonl")
+    
+    total_lines = sum(1 for _ in open(input_file, 'r', encoding='utf-8'))
+    
+    with open(input_file, 'r', encoding='utf-8') as infile, \
+         open(output_file, 'w', encoding='utf-8') as outfile:
+        
+        batch_size = 32
+        batch_lines = []
+        batch_contents = []
+        
+        with tqdm(total=total_lines, desc="Embedding chunks") as pbar:
+            for line in infile:
+                data = json.loads(line.strip())
+                batch_lines.append(data)
+                batch_contents.append(data["content"])
+                
+                if len(batch_contents) == batch_size:
+                    embeddings = model.encode(batch_contents)
+                    if dimension < embeddings.shape[1]:
+                        embeddings = embeddings[:, :dimension]
+                    
+                    for i, embedding in enumerate(embeddings):
+                        batch_lines[i]["embedding"] = embedding.tolist()
+                        outfile.write(json.dumps(batch_lines[i], ensure_ascii=False) + '\n')
+                    
+                    pbar.update(len(batch_lines))
+                    batch_lines = []
+                    batch_contents = []
+            
+            if batch_contents:
+                embeddings = model.encode(batch_contents)
+                if dimension < embeddings.shape[1]:
+                    embeddings = embeddings[:, :dimension]
+                
+                for i, embedding in enumerate(embeddings):
+                    batch_lines[i]["embedding"] = embedding.tolist()
+                    outfile.write(json.dumps(batch_lines[i], ensure_ascii=False) + '\n')
+                
+                pbar.update(len(batch_lines))
+    
+    output_vol.commit()
+    return output_file
