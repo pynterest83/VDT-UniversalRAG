@@ -1,16 +1,11 @@
-# # Finetuning BGE-M3 Embedding Model for Vietnamese Medical QA
-
-# This example demonstrates how to finetune the BGE-M3 embedding model using Modal cloud
-# infrastructure with GPU acceleration. The model is trained on Vietnamese medical question-answer
-# data using Matryoshka representation learning for efficient embeddings at multiple dimensions.
-
 from pathlib import Path
 import json
 import modal
+import hashlib
 
 VOL_MOUNT_PATH = Path("/vol")
 
-# BGE-M3 base model for embedding finetuning
+# BAAI/bge-m3 base model for embedding finetuning (1024 dimensions)
 BASE_MODEL = "BAAI/bge-m3"
 
 # Define the Modal image with all necessary dependencies
@@ -60,21 +55,45 @@ def load_jsonl_file(file_path: str):
     return data
 
 def prepare_data_for_training(qa_data):
-    """Convert QA data to the format expected by sentence transformers"""
+    """Convert QA data to format expected by sentence transformers - KHÔNG deduplicate"""
     prepared_data = []
+    
     for item in qa_data:
         prepared_item = {
             "id": item["question_idx"],
-            "anchor": item["question"],  # Query
-            "positive": item["context"],  # Relevant document
+            "anchor": item["question"],
+            "positive": item["context"],
             "answer": item["answer"],
             "title": item.get("title", ""),
             "keyword": item.get("keyword", ""),
         }
         prepared_data.append(prepared_item)
+    
+    print(f"📊 Training data prepared:")
+    print(f"   Total samples: {len(prepared_data)}")
+    
     return prepared_data
 
-# ## Finetuning BGE-M3 on Vietnamese Medical QA dataset
+def deduplicate_corpus_for_evaluation(corpus_data):
+    """Remove duplicate content from corpus used for evaluation"""
+    content_to_first_id = {}
+    unique_corpus = {}
+    
+    for item_id, content in corpus_data.items():
+        content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
+        
+        if content_hash not in content_to_first_id:
+            content_to_first_id[content_hash] = item_id
+            unique_corpus[item_id] = content
+        # Skip duplicates
+    
+    print(f"📊 Corpus deduplication:")
+    print(f"   Original entries: {len(corpus_data)}")
+    print(f"   Unique entries: {len(unique_corpus)}")
+    
+    return unique_corpus
+
+# ## Finetuning BAAI/bge-m3 on Vietnamese Medical QA dataset
 
 @app.function(
     gpu="A100",
@@ -87,19 +106,16 @@ def finetune_embeddings(
     import torch
     from datasets import Dataset
     from sentence_transformers import SentenceTransformer, SentenceTransformerModelCardData
-    from sentence_transformers.losses import MatryoshkaLoss, MultipleNegativesRankingLoss
+    from sentence_transformers.losses import MultipleNegativesRankingLoss
     from sentence_transformers import SentenceTransformerTrainingArguments, SentenceTransformerTrainer
     from sentence_transformers.training_args import BatchSamplers
-    from sentence_transformers.evaluation import InformationRetrievalEvaluator, SequentialEvaluator
+    from sentence_transformers.evaluation import InformationRetrievalEvaluator
     from sentence_transformers.util import cos_sim
     
     restarts = track_restarts(restart_tracker_dict)
     
-    # Matryoshka dimensions (large to small)
-    matryoshka_dimensions = [1024, 768, 512, 256, 128, 64]
-    
-    print("Loading BGE-M3 model...")
-    # Load model without Flash Attention for baseline comparison
+    print("Loading BAAI/bge-m3 model...")
+    # Load model with multilingual support (1024 dimensions)
     model = SentenceTransformer(
         BASE_MODEL,
         model_card_data=SentenceTransformerModelCardData(
@@ -121,12 +137,12 @@ def finetune_embeddings(
     print(f"Loaded {len(test_data)} test samples from JSONL (FULL DATASET)")
     print(f"Loaded {len(validation_data)} validation samples from JSONL (FULL DATASET)")
     
-    # Prepare data for training
+    # Prepare data for training - GIỮ NGUYÊN tất cả samples
     prepared_train = prepare_data_for_training(train_data)
     prepared_test = prepare_data_for_training(test_data)
     prepared_validation = prepare_data_for_training(validation_data)
     
-    # Convert to datasets
+    # Convert to datasets - FULL training data
     train_dataset = Dataset.from_list(prepared_train)
     test_dataset = Dataset.from_list(prepared_test)
     validation_dataset = Dataset.from_list(prepared_validation)
@@ -143,65 +159,92 @@ def finetune_embeddings(
         print(f"Question: {sample['anchor'][:100]}...")
         print(f"Context: {sample['positive'][:100]}...")
     
-    # Create evaluation setup - use full corpus since dataset is smaller now
+    # CHỈ deduplicate cho evaluation corpus
     all_data = prepared_train + prepared_validation + prepared_test
     corpus_dataset = Dataset.from_list(all_data)
     
-    # Use full corpus (no shrinking needed for 10k dataset)
-    corpus = dict(zip(corpus_dataset["id"], corpus_dataset["positive"]))
-    queries = dict(zip(test_dataset["id"], test_dataset["anchor"]))
+    # Tạo corpus RAW (có duplicates) 
+    corpus_raw = dict(zip(corpus_dataset["id"], corpus_dataset["positive"]))
     
-    # Create relevant docs mapping
-    relevant_docs = {}
-    for q_id in queries:
-        relevant_docs[q_id] = [q_id]
+    # CHỈ deduplicate cho evaluation
+    corpus = deduplicate_corpus_for_evaluation(corpus_raw)
+    
+    # Helper function to build relevant_docs mapping
+    def build_relevant_docs(dataset, corpus_raw, corpus):
+        """Build relevant docs mapping handling deduplication correctly"""
+        queries = dict(zip(dataset["id"], dataset["anchor"]))
+        relevant_docs = {}
+        
+        for q_id in queries:
+            if q_id in corpus:  # Nếu question này có trong deduplicated corpus
+                relevant_docs[q_id] = [q_id]  # Chỉ point đến chính nó
+            else:
+                # Nếu bị deduplicate, tìm ID đại diện có cùng content
+                original_content = corpus_raw[q_id]
+                for corpus_id, corpus_content in corpus.items():
+                    if corpus_content == original_content:
+                        relevant_docs[q_id] = [corpus_id]
+                        break
+                else:
+                    relevant_docs[q_id] = []
+        
+        return queries, relevant_docs
+    
+    # Create SEPARATE evaluators for validation and test to avoid data leakage
+    
+    # 1. Validation evaluator (for training monitoring)
+    val_queries, val_relevant_docs = build_relevant_docs(validation_dataset, corpus_raw, corpus)
+    
+    val_ir_evaluator = InformationRetrievalEvaluator(
+        queries=val_queries,
+        corpus=corpus,
+        relevant_docs=val_relevant_docs,
+        name="validation",
+        score_functions={"cosine": cos_sim},
+        show_progress_bar=True,
+        batch_size=32,
+    )
+    
+    # 2. Test evaluator (for baseline and final evaluation only)
+    test_queries, test_relevant_docs = build_relevant_docs(test_dataset, corpus_raw, corpus)
+    
+    test_ir_evaluator = InformationRetrievalEvaluator(
+        queries=test_queries,
+        corpus=corpus,
+        relevant_docs=test_relevant_docs,
+        name="test",
+        score_functions={"cosine": cos_sim},
+        show_progress_bar=True,
+        batch_size=32,
+    )
     
     print(f"\nEvaluation setup:")
-    print(f"Number of queries: {len(queries)}")
+    print(f"Number of validation queries: {len(val_queries)}")
+    print(f"Number of test queries: {len(test_queries)}")
     print(f"Number of corpus documents: {len(corpus)}")
-    print(f"Number of relevant docs mappings: {len(relevant_docs)}")
+    print(f"Number of validation relevant docs mappings: {len(val_relevant_docs)}")
+    print(f"Number of test relevant docs mappings: {len(test_relevant_docs)}")
     
-    # Run baseline evaluation before training
+    # Run baseline evaluation on TEST SET before training
     print("\n" + "="*50)
-    print("BASELINE EVALUATION (Before Training)")
+    print("BASELINE EVALUATION (Before Training) - TEST SET")
     print("="*50)
     
-    # Create evaluators for baseline evaluation and training monitoring
-    matryoshka_evaluators = []
-    for dim in matryoshka_dimensions:
-        ir_evaluator = InformationRetrievalEvaluator(
-            queries=queries,
-            corpus=corpus,
-            relevant_docs=relevant_docs,
-            name=f"dim_{dim}",
-            truncate_dim=dim,
-            score_functions={"cosine": cos_sim},
-            show_progress_bar=True,
-            batch_size=32,
-        )
-        matryoshka_evaluators.append(ir_evaluator)
+    baseline_results = test_ir_evaluator(model)
     
-    evaluator = SequentialEvaluator(matryoshka_evaluators)
-    baseline_results = evaluator(model)
-    
-    print("Baseline Results:")
-    for dim in matryoshka_dimensions:
-        key = f"dim_{dim}_cosine_ndcg@10"
-        print(f"{key}: {baseline_results[key]:.4f}")
+    print("Baseline Results (Test Set):")
+    print(f"cosine_ndcg@10: {baseline_results['test_cosine_ndcg@10']:.4f}")
     
     # Clear GPU cache after baseline evaluation
     torch.cuda.empty_cache()
     print("GPU memory cleared after baseline evaluation")
+
+    val_baseline_results = val_ir_evaluator(model)
+    print("Validation Baseline Results:")
+    print(f"cosine_ndcg@10: {val_baseline_results['validation_cosine_ndcg@10']:.4f}")
     
-    # Clear any existing GPU cache
-    torch.cuda.empty_cache()
-    print("GPU memory cleared before training")
-    
-    # Setup Matryoshka loss
-    inner_train_loss = MultipleNegativesRankingLoss(model)
-    train_loss = MatryoshkaLoss(
-        model, inner_train_loss, matryoshka_dims=matryoshka_dimensions
-    )
+    # Setup standard contrastive loss
+    train_loss = MultipleNegativesRankingLoss(model)
     
     # Define training arguments - with validation evaluation
     args = SentenceTransformerTrainingArguments(
@@ -223,36 +266,63 @@ def finetune_embeddings(
         logging_steps=50,                           
         save_total_limit=3,                         
         load_best_model_at_end=True,
-        metric_for_best_model="eval_dim_1024_cosine_ndcg@10",
-        dataloader_num_workers=4,                   
-        dataloader_pin_memory=False,                
+        metric_for_best_model="eval_validation_cosine_ndcg@10"
     )
 
-    # Create trainer with validation dataset and evaluator
+    # Create trainer with validation dataset and VALIDATION evaluator (NO TEST DATA LEAKAGE)
     trainer = SentenceTransformerTrainer(
         model=model,
         args=args,
         train_dataset=train_dataset.select_columns(["anchor", "positive"]),
-        eval_dataset=validation_dataset.select_columns(["anchor", "positive"]),
         loss=train_loss,
-        evaluator=evaluator,
+        evaluator=val_ir_evaluator,
     )
     
     try:
-        # Check if there's actually a valid checkpoint directory before resuming
+        # Better checkpoint detection and validation
         checkpoint_dir = VOL_MOUNT_PATH / "bge-m3-medical"
-        checkpoint_subdirs = list(checkpoint_dir.glob("checkpoint-*")) if checkpoint_dir.exists() else []
+        resume_from_checkpoint = None
         
-        if restarts > 0 and checkpoint_subdirs:
-            # Find the latest checkpoint
-            latest_checkpoint = max(checkpoint_subdirs, key=lambda x: int(x.name.split("-")[1]))
-            resume_from_checkpoint = str(latest_checkpoint)
-            print(f"Resuming from checkpoint: {resume_from_checkpoint} (restart count: {restarts})")
+        if checkpoint_dir.exists():
+            # Find all valid checkpoint directories
+            checkpoint_subdirs = [d for d in checkpoint_dir.glob("checkpoint-*") if d.is_dir()]
+            
+            if checkpoint_subdirs and restarts > 0:
+                # Sort by step number and find the latest
+                valid_checkpoints = []
+                for ckpt_dir in checkpoint_subdirs:
+                    # Check if checkpoint has required files
+                    required_files = [
+                        ckpt_dir / "trainer_state.json",
+                        ckpt_dir / "training_args.bin",
+                    ]
+                    # Check for either pytorch_model.bin or model.safetensors
+                    model_files = [
+                        ckpt_dir / "pytorch_model.bin",
+                        ckpt_dir / "model.safetensors",
+                    ]
+                    
+                    if all(f.exists() for f in required_files) and any(f.exists() for f in model_files):
+                        try:
+                            step_num = int(ckpt_dir.name.split("-")[1])
+                            valid_checkpoints.append((step_num, ckpt_dir))
+                        except (IndexError, ValueError):
+                            continue
+                
+                if valid_checkpoints:
+                    # Get the latest valid checkpoint
+                    latest_step, latest_checkpoint = max(valid_checkpoints, key=lambda x: x[0])
+                    resume_from_checkpoint = str(latest_checkpoint)
+                    print(f"Resuming from checkpoint: {resume_from_checkpoint} (step {latest_step}, restart count: {restarts})")
+                else:
+                    print(f"No valid checkpoints found. Starting fresh training (restart count: {restarts})")
+            else:
+                print(f"No checkpoints to resume from (restart count: {restarts})")
         else:
-            resume_from_checkpoint = None
             print(f"Starting fresh training (restart count: {restarts})")
         
         print("Starting training on FULL DATASET...")
+        print("📊 Training will be monitored using VALIDATION SET (no test data leakage)")
         trainer.train(resume_from_checkpoint=resume_from_checkpoint)
         
         # Clear GPU cache after training completes
@@ -266,19 +336,43 @@ def finetune_embeddings(
         # Clear memory on interrupt
         torch.cuda.empty_cache()
         raise
-    
-    # Save the best model
+    except Exception as e:
+        print(f"Training failed with error: {e}")
+        # Save current state even on failure
+        try:
+            trainer.save_state()
+            trainer.save_model()
+        except:
+            pass
+        torch.cuda.empty_cache()
+        raise
+
+    # Save the best model with explicit path checking
     print("Saving final model...")
-    trainer.save_model()
+    try:
+        trainer.save_model()
+        
+        # Verify the model was saved correctly
+        final_model_path = VOL_MOUNT_PATH / "bge-m3-medical"
+        model_files = list(final_model_path.glob("*.bin")) + list(final_model_path.glob("*.safetensors"))
+        
+        if not model_files:
+            print("Warning: No model files found after saving. Attempting manual save...")
+            # Manual save as fallback
+            model.save(str(final_model_path))
+        
+        print(f"Model saved successfully to {final_model_path}")
+        
+    except Exception as e:
+        print(f"Error saving model: {e}")
+        # Fallback save
+        fallback_path = VOL_MOUNT_PATH / "bge-m3-medical-fallback"
+        model.save(str(fallback_path))
+        print(f"Model saved to fallback path: {fallback_path}")
     
-    # Clear GPU cache and delete trainer to free memory
-    del trainer
-    torch.cuda.empty_cache()
-    print("GPU memory cleared after saving model")
-    
-    # Evaluate fine-tuned model after training
+    # Evaluate fine-tuned model after training ON TEST SET
     print("\n" + "="*50)
-    print("FINAL EVALUATION (After Training)")
+    print("FINAL EVALUATION (After Training) - TEST SET")
     print("="*50)
     
     # Load the fine-tuned model
@@ -287,28 +381,10 @@ def finetune_embeddings(
         device="cuda" if torch.cuda.is_available() else "cpu"
     )
     
-    # Recreate evaluator for final evaluation only
-    matryoshka_evaluators = []
-    for dim in matryoshka_dimensions:
-        ir_evaluator = InformationRetrievalEvaluator(
-            queries=queries,
-            corpus=corpus,
-            relevant_docs=relevant_docs,
-            name=f"dim_{dim}",
-            truncate_dim=dim,
-            score_functions={"cosine": cos_sim},
-            show_progress_bar=True,
-            batch_size=64,                          # Smaller batch size
-        )
-        matryoshka_evaluators.append(ir_evaluator)
-    
-    evaluator = SequentialEvaluator(matryoshka_evaluators)
-    
-    final_results = evaluator(fine_tuned_model)
-    print("Fine-tuned Results:")
-    for dim in matryoshka_dimensions:
-        key = f"dim_{dim}_cosine_ndcg@10"
-        print(f"{key}: {final_results[key]:.4f}")
+    # Run final evaluation on TEST SET
+    final_results = test_ir_evaluator(fine_tuned_model)
+    print("Fine-tuned Results (Test Set):")
+    print(f"cosine_ndcg@10: {final_results['test_cosine_ndcg@10']:.4f}")
     
     # Clear GPU cache after final evaluation
     torch.cuda.empty_cache()
@@ -316,18 +392,16 @@ def finetune_embeddings(
     
     # Show improvement comparison
     print("\n" + "="*50)
-    print("IMPROVEMENT SUMMARY")
+    print("IMPROVEMENT SUMMARY (TEST SET)")
     print("="*50)
-    for dim in matryoshka_dimensions:
-        key = f"dim_{dim}_cosine_ndcg@10"
-        baseline = baseline_results[key]
-        final = final_results[key]
-        improvement = final - baseline
-        if baseline > 0:
-            improvement_pct = (improvement / baseline) * 100
-            print(f"dim_{dim}: {baseline:.4f} → {final:.4f} (+{improvement:.4f}, +{improvement_pct:.1f}%)")
-        else:
-            print(f"dim_{dim}: baseline skipped → {final:.4f}")
+    baseline_score = baseline_results['test_cosine_ndcg@10']
+    final_score = final_results['test_cosine_ndcg@10']
+    improvement = final_score - baseline_score
+    if baseline_score > 0:
+        improvement_pct = (improvement / baseline_score) * 100
+        print(f"NDCG@10: {baseline_score:.4f} → {final_score:.4f} (+{improvement:.4f}, +{improvement_pct:.1f}%)")
+    else:
+        print(f"NDCG@10: baseline skipped → {final_score:.4f}")
     print("="*50)
     
     # Reset restart counter on successful completion
@@ -384,197 +458,51 @@ class EmbeddingModel:
         print("Model loaded successfully!")
     
     @modal.method()
-    def encode(self, texts: list[str], dimension: int = 768) -> list[list[float]]:
-        """Encode texts to embeddings with specified dimension"""
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        """Encode texts to 1024-dimensional embeddings"""
         embeddings = self.model.encode(texts)
-        
-        # Truncate to specified dimension for Matryoshka representation
-        if dimension < embeddings.shape[1]:
-            embeddings = embeddings[:, :dimension]
-        
         return embeddings.tolist()
     
     @modal.method()
-    def similarity(self, query: str, documents: list[str], dimension: int = 768) -> list[float]:
+    def similarity(self, query: str, documents: list[str]) -> list[float]:
         """Compute similarity between query and documents"""
         from sentence_transformers.util import cos_sim
         
         query_embedding = self.model.encode([query])
         doc_embeddings = self.model.encode(documents)
         
-        # Truncate embeddings if needed
-        if dimension < query_embedding.shape[1]:
-            query_embedding = query_embedding[:, :dimension]
-            doc_embeddings = doc_embeddings[:, :dimension]
-        
         similarities = cos_sim(query_embedding, doc_embeddings)[0]
         return similarities.tolist()
 
-# ## Evaluation function
-
-@app.function(gpu="A100", volumes={VOL_MOUNT_PATH: output_vol}, timeout=43200)
-def evaluate_model():
-    """Evaluate the finetuned model using FULL test dataset"""
-    import torch
-    from sentence_transformers import SentenceTransformer
-    from sentence_transformers.evaluation import InformationRetrievalEvaluator, SequentialEvaluator
-    from sentence_transformers.util import cos_sim
-    from datasets import Dataset
-    
-    # Load the finetuned model
-    model_path = VOL_MOUNT_PATH / "bge-m3-medical"
-    model = SentenceTransformer(
-        str(model_path),
-        device="cuda" if torch.cuda.is_available() else "cpu"
-    )
-    
-    print("Loading FULL test data for evaluation...")
-    # Load ALL test data from datasets directory
-    test_data = load_jsonl_file("/datasets/q_a_test_filtered.jsonl")  # No limiting
-    prepared_test = prepare_data_for_training(test_data)
-    
-    test_dataset = Dataset.from_list(prepared_test)
-    
-    # Use full corpus for evaluation
-    all_data = load_jsonl_file("/datasets/q_a_train_filtered_10k.jsonl") + \
-               load_jsonl_file("/datasets/q_a_validation_filtered.jsonl") + \
-               test_data
-    all_prepared = prepare_data_for_training(all_data)
-    all_corpus_dataset = Dataset.from_list(all_prepared)
-    
-    # Use full corpus (no shrinking)
-    corpus = dict(zip(all_corpus_dataset["id"], all_corpus_dataset["positive"]))
-    queries = dict(zip(test_dataset["id"], test_dataset["anchor"]))
-    relevant_docs = {q_id: [q_id] for q_id in queries}
-    
-    print(f"Evaluating on {len(queries)} test queries (FULL DATASET)")
-    
-    # Create evaluators for different dimensions
-    matryoshka_dimensions = [1024, 768, 512, 256, 128, 64]
-    matryoshka_evaluators = []
-    
-    for dim in matryoshka_dimensions:
-        ir_evaluator = InformationRetrievalEvaluator(
-            queries=queries,
-            corpus=corpus,
-            relevant_docs=relevant_docs,
-            name=f"dim_{dim}",
-            truncate_dim=dim,
-            score_functions={"cosine": cos_sim},
-            show_progress_bar=True,
-            batch_size=256,                         # Maximized for A100 40GB
-        )
-        matryoshka_evaluators.append(ir_evaluator)
-    
-    evaluator = SequentialEvaluator(matryoshka_evaluators)
-    
-    # Run evaluation
-    results = evaluator(model)
-    
-    # Clear GPU cache after evaluation
-    torch.cuda.empty_cache()
-    print("GPU memory cleared after evaluation")
-    
-    # Print results
-    print("\nEvaluation Results (FULL DATASET):")
-    for dim in matryoshka_dimensions:
-        key = f"dim_{dim}_cosine_ndcg@10"
-        print(f"{key}: {results[key]:.4f}")
-    
-    return results
-
-# ## Local entrypoint
-
-@app.local_entrypoint()
-def main():
-    """Test the finetuned embedding model with real data"""
-    
-    # For local entrypoint, we need to access local files directly
-    import os
-    
-    if os.path.exists("datasets/q_a_test_filtered.jsonl"):
-        test_data = load_jsonl_file("datasets/q_a_test_filtered.jsonl")[:3]
-    else:
-        print("No test data found locally. Please ensure datasets/q_a_test_filtered.jsonl exists.")
-        return
-    
-    # Example usage with real data
-    embedding_model = EmbeddingModel()
-    
-    for i, sample in enumerate(test_data):
-        query = sample["question"]
-        # Use the context as one of the documents along with some variations
-        documents = [
-            sample["context"],
-            f"Thông tin y tế khác không liên quan đến {sample.get('keyword', 'chủ đề')}",
-            f"Tài liệu y tế về {sample.get('keyword', 'thuốc')} với nội dung khác"
-        ]
-        
-        # Test similarity computation
-        similarities = embedding_model.similarity.remote(query, documents, dimension=512)
-        
-        print(f"\n--- Sample {i+1} ---")
-        print(f"Query: {query}")
-        print(f"Answer: {sample['answer']}")
-        print("\nDocument similarities:")
-        for j, (doc, sim) in enumerate(zip(documents, similarities)):
-            print(f"{j+1}. Similarity: {sim:.4f}")
-            print(f"   Document: {doc[:100]}{'...' if len(doc) > 100 else ''}")
-        print()
-
-# ## CLI Usage Examples
-
-# To start finetuning:
-# modal run --detach embeddings.py::finetune_embeddings --num-train-epochs=4
-
-# To monitor training with tensorboard:
-# Visit: https://ise703--bge-m3-medical-embeddings-monitor-dev.modal.run
-
-# To evaluate the model:
-# modal run embeddings.py::evaluate_model
-
-# To test inference with real data:
-# modal run embeddings.py
-
-# ## Complete training and evaluation workflow
-
 @app.function(gpu="A100", timeout=43200)
 def run_complete_workflow(num_train_epochs: int = 4):
-    """Run the complete workflow on FULL dataset: train model and then evaluate it separately"""
+    """Run the complete training workflow with built-in evaluation"""
     
-    print("🚀 Starting complete BGE-M3 finetuning workflow on FULL DATASET...")
+    print("🚀 Starting complete BGE-M3 finetuning workflow...")
     
-    # Step 1: Run training on full dataset
-    print("\n📊 Step 1: Training the model on FULL DATASET...")
+    # Just run training - it includes all evaluation now
     training_results = finetune_embeddings.remote(num_train_epochs=num_train_epochs)
     
-    # Step 2: Run separate evaluation on full dataset
-    print("\n📈 Step 2: Running separate evaluation on FULL DATASET...")
-    evaluation_results = evaluate_model.remote()
-    
-    print("\n✅ Complete workflow finished on FULL DATASET!")
-    return {
-        "training": training_results,
-        "evaluation": evaluation_results
-    }
+    print("\n✅ Complete workflow finished!")
+    return training_results
 
 @app.function(
     gpu="A10G", 
     volumes={VOL_MOUNT_PATH: output_vol}, 
-    timeout=21600  # 6 hours timeout - this was the main issue
+    timeout=21600  # 6 hours timeout
 )
-def embed_chunked_corpus(dimension: int = 1024):
+def embed_chunked_corpus():
     import json
     from sentence_transformers import SentenceTransformer
     from tqdm import tqdm
     
     model = SentenceTransformer(
-        str(VOL_MOUNT_PATH / "bge-m3-medical" / "checkpoint-780"),
+        str(VOL_MOUNT_PATH / "bge-m3-medical" ),
         device="cuda"
     )
     
-    input_file = "/datasets/chunks/context_corpus.jsonl"
-    output_file = str(VOL_MOUNT_PATH / "context_corpus_embedded.jsonl")
+    input_file = "/datasets/chunks/context_corpus_clean.jsonl"
+    output_file = str(VOL_MOUNT_PATH / "context_corpus_embedded_clean_2.jsonl")
     
     total_lines = sum(1 for _ in open(input_file, 'r', encoding='utf-8'))
     
@@ -593,8 +521,6 @@ def embed_chunked_corpus(dimension: int = 1024):
                 
                 if len(batch_contents) == batch_size:
                     embeddings = model.encode(batch_contents)
-                    if dimension < embeddings.shape[1]:
-                        embeddings = embeddings[:, :dimension]
                     
                     for i, embedding in enumerate(embeddings):
                         batch_lines[i]["embedding"] = embedding.tolist()
@@ -606,8 +532,6 @@ def embed_chunked_corpus(dimension: int = 1024):
             
             if batch_contents:
                 embeddings = model.encode(batch_contents)
-                if dimension < embeddings.shape[1]:
-                    embeddings = embeddings[:, :dimension]
                 
                 for i, embedding in enumerate(embeddings):
                     batch_lines[i]["embedding"] = embedding.tolist()
@@ -617,3 +541,14 @@ def embed_chunked_corpus(dimension: int = 1024):
     
     output_vol.commit()
     return output_file
+
+# ## CLI Usage Examples
+
+# To start finetuning:
+# modal run --detach embeddings.py::finetune_embeddings --num-train-epochs=4
+
+# To monitor training with tensorboard:
+# Visit: https://ise703--bge-m3-medical-embeddings-monitor-dev.modal.run
+
+# To test inference with real data:
+# modal run embeddings.py

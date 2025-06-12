@@ -182,5 +182,8 @@ Vi-Text-VQA
 datasets/
 *.crt
 results/
-bge_m3_v1/
+bge-m3-v3/
 bge_m3_v2/
+bkcare-v1/
+build_rerank_dataset.py
+reranker.py

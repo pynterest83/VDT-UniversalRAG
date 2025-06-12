@@ -16,7 +16,7 @@ class VectorStore:
 
     def __init__(self, collection_name: str = "universal-rag", delete_existing: bool = False):
         self.embedding_model = HuggingFaceEmbeddings(
-            model_name="bge_m3_v2/checkpoint-780"
+            model_name="bge-m3-v3"
         )
 
         self.collection_name = collection_name
@@ -187,13 +187,13 @@ class VectorStore:
 
 if __name__ == "__main__": 
     # Example usage with JSONL file
-    jsonl_file = "datasets/context_corpus_embedded.jsonl"
-    vector_store = VectorStore(collection_name="universal-rag-precomputed", delete_existing=False)
-    # vector_store.load_documents_from_jsonl(jsonl_file)
+    jsonl_file = "datasets/context_corpus_embedded_clean_2.jsonl"
+    vector_store = VectorStore(collection_name="universal-rag-precomputed-clean-2", delete_existing=True)
+    vector_store.load_documents_from_jsonl(jsonl_file)
     
     # Embedding model is now created outside the vector store for querying
     embedding_model = HuggingFaceEmbeddings(
-        model_name="bge_m3_v2/checkpoint-780"
+        model_name="bge-m3-v3"
     )
 
     test_queries = [

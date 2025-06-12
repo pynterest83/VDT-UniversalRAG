@@ -16,7 +16,7 @@ class TopKAccuracyBenchmark:
         self.vector_store = vector_store
         # Create embedding model for query encoding
         self.embedding_model = HuggingFaceEmbeddings(
-            model_name="bge_m3_v2/checkpoint-780"
+            model_name="bge-m3-v3"
         )
     
     def load_qa_dataset(self, jsonl_path: str) -> List[Dict[str, Any]]:
@@ -160,39 +160,13 @@ class TopKAccuracyBenchmark:
         }
         
         return benchmark_results
-    
-    def detailed_analysis(self, qa_jsonl_path: str, k: int = 10, sample_size: int = 10) -> None:
-        """Perform detailed analysis on a sample of results"""
-        qa_dataset = self.load_qa_dataset(qa_jsonl_path)
-        sample_dataset = qa_dataset[:sample_size]
-        
-        print(f"\n=== Detailed Analysis (Top-{k}, {sample_size} samples) ===")
-        
-        for i, qa_item in enumerate(sample_dataset):
-            print(f"\n--- Sample {i+1} ---")
-            print(f"Question: {qa_item.get('question', '')[:100]}...")
-            
-            result = self.evaluate_sample(qa_item, k=k)
-            
-            if result.get('error'):
-                print(f"Error: {result['error']}")
-                continue
-                
-            print(f"Found in Top-{k}: {'✓' if result['found'] else '✗'}")
-            print(f"Ground Truth Context: {qa_item.get('context', '')[:200]}...")
-            
-            # Show top-3 retrieved contexts
-            retrieved_with_scores = self.retrieve_documents_with_scores(qa_item.get('question', ''), k=3)
-            print("Top-3 Retrieved Contexts:")
-            for j, (context, score) in enumerate(retrieved_with_scores):
-                print(f"  {j+1}. (Score: {score:.4f}) {context[:150]}...")
 
 
 def main():
     # Initialize vector store
     print("Initializing Vector Store...")
     vector_store = VectorStore(
-        collection_name="universal-rag-precomputed", 
+        collection_name="universal-rag-precomputed-clean-2", 
         delete_existing=False
     )
     
@@ -202,7 +176,7 @@ def main():
     # Run benchmark
     results = benchmark.benchmark(
         qa_jsonl_path="datasets/q_a_test_filtered.jsonl",
-        k_values=[5]
+        k_values=[1, 5]
     )
     
     # Print results
@@ -219,22 +193,12 @@ def main():
     
     # Save results
     os.makedirs('results', exist_ok=True)
-    output_path = 'results/topk_accuracy_results.json'
+    output_path = 'results/topk_accuracy_results_bge_m3_v3.json'
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     
     print(f"\nResults saved to {output_path}")
     
-    # Run detailed analysis on a sample
-    print("\n" + "="*50)
-    print("DETAILED ANALYSIS")
-    print("="*50)
-    benchmark.detailed_analysis(
-        qa_jsonl_path="datasets/q_a_test_filtered.jsonl",
-        k=10,
-        sample_size=5
-    )
-
 
 if __name__ == "__main__":
     main()
