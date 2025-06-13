@@ -2,12 +2,10 @@ import uuid
 from typing import TypedDict, List, Optional
 import os
 from dotenv import load_dotenv
-from langchain_huggingface import HuggingFaceEmbeddings
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from openai import AzureOpenAI
+import requests
 import json
 import tiktoken
+from openai import AzureOpenAI
 
 load_dotenv()
 
@@ -26,22 +24,16 @@ class GraphState(TypedDict):
     final_answer: Optional[str]
     error: Optional[str]
 
+# --- Modal API Configuration ---
+MODAL_BASE_URL = "https://ise703--universal-rag-models"
+MODAL_ENDPOINTS = {
+    "context_embedding": f"{MODAL_BASE_URL}-embed-context.modal.run",
+    "image_embedding": f"{MODAL_BASE_URL}-embed-image-caption.modal.run",
+    "reranker": f"{MODAL_BASE_URL}-rerank-documents.modal.run"
+}
 
-# --- Khởi tạo các thành phần ---
+# --- Initialize components (only local ones) ---
 def initialize_components():
-    context_embedding_model = HuggingFaceEmbeddings(model_name="./bge-m3-v3")
-    
-    reranker_model_path = "AITeamVN/Vietnamese_Reranker"
-    reranker_tokenizer = AutoTokenizer.from_pretrained(reranker_model_path, use_fast=False)
-    reranker_model = AutoModelForSequenceClassification.from_pretrained(
-        reranker_model_path,
-        torch_dtype=torch.float16,
-        device_map="auto" if torch.cuda.is_available() else None
-    )
-    reranker_model.eval()
-    
-    image_embedding_model = HuggingFaceEmbeddings(model_name="./bge-m3-image")
-    
     azure_client = AzureOpenAI(
         azure_endpoint=os.getenv("AZURE_ENDPOINT"),
         api_key=os.getenv("AZURE_API_KEY"),
@@ -51,36 +43,78 @@ def initialize_components():
     context_store = VectorStore(collection_name="universal-rag-precomputed-enhanced")
     image_store = VectorStore(collection_name="image-captions-store")
     
-    return context_embedding_model, reranker_tokenizer, reranker_model, image_embedding_model, azure_client, context_store, image_store
+    return azure_client, context_store, image_store
 
-context_embedding_model, reranker_tokenizer, reranker_model, image_embedding_model, azure_client, context_store, image_store = initialize_components()
-MAX_LENGTH = 2304
+azure_client, context_store, image_store = initialize_components()
 
 # Initialize tiktoken encoder for GPT-4o
 encoding = tiktoken.encoding_for_model("gpt-4o")
 
-def rerank_documents(query: str, documents: List[dict], top_k: int = 5) -> List[dict]:
-    if len(documents) <= top_k:
-        return documents
-    
-    doc_contents = [doc['content'] for doc in documents]
-    pairs = [[query, doc_content] for doc_content in doc_contents]
-    
-    with torch.no_grad():
-        inputs = reranker_tokenizer(pairs, padding=True, truncation=True, return_tensors='pt', max_length=MAX_LENGTH)
-        if torch.cuda.is_available() and reranker_model.device.type == 'cuda':
-            inputs = {k: v.to(reranker_model.device) for k, v in inputs.items()}
-        scores = reranker_model(**inputs, return_dict=True).logits.view(-1, ).float()
-    
-    document_scores = list(zip(documents, scores.cpu().numpy()))
-    document_scores.sort(key=lambda x: x[1], reverse=True)
-    
-    reranked_docs = []
-    for i, (doc, score) in enumerate(document_scores[:top_k]):
-        doc['rerank_score'] = float(score)
-        reranked_docs.append(doc)
-    
-    return reranked_docs
+# --- Modal API Helper Functions ---
+def get_context_embedding(text: str) -> List[float]:
+    """Get context embedding from Modal endpoint"""
+    try:
+        response = requests.post(
+            MODAL_ENDPOINTS["context_embedding"],
+            json={"text": text},
+            timeout=120
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result["embedding"]
+    except Exception as e:
+        raise Exception(f"Context embedding API error: {str(e)}")
+
+def get_image_embedding(text: str) -> List[float]:
+    """Get image embedding from Modal endpoint"""
+    try:
+        response = requests.post(
+            MODAL_ENDPOINTS["image_embedding"],
+            json={"text": text},
+            timeout=120
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result["embedding"]
+    except Exception as e:
+        raise Exception(f"Image embedding API error: {str(e)}")
+
+def rerank_documents_api(query: str, documents: List[dict], top_k: int = 5) -> List[dict]:
+    """Rerank documents using Modal endpoint"""
+    try:
+        response = requests.post(
+            MODAL_ENDPOINTS["reranker"],
+            json={
+                "query": query,
+                "documents": documents,
+                "top_k": top_k
+            },
+            timeout=240
+        )
+        response.raise_for_status()
+        result = response.json()
+        
+        # Check if we got a successful reranking result
+        if "reranked_documents" in result and result["reranked_documents"]:
+            return result["reranked_documents"]
+        elif "error" in result:
+            print(f"Reranker returned error: {result['error']}")
+            # Use fallback reranked_documents if available
+            if "reranked_documents" in result:
+                return result["reranked_documents"]
+        
+        # If no valid reranked documents, return original with default scores
+        raise Exception("No valid reranked documents returned")
+        
+    except Exception as e:
+        print(f"Reranker API error: {str(e)}")
+        # Fallback: return original documents with default scores
+        fallback_docs = []
+        for i, doc in enumerate(documents[:top_k]):
+            doc_copy = doc.copy()
+            doc_copy['rerank_score'] = 1.0 - (i * 0.1)  # Descending scores
+            fallback_docs.append(doc_copy)
+        return fallback_docs
 
 def llm_select_context(question: str, ranked_chunks: List[dict]) -> List[dict]:
     
@@ -115,62 +149,25 @@ Bạn là một chuyên gia phân tích thông tin y tế với chuyên môn sâ
 - Sinh lý bệnh và cơ chế bệnh tật
 - Điều trị và phòng ngừa bệnh
 
-## NHIỆM VỤ CỤ THỂ
-Phân tích danh sách context đã được sắp xếp theo độ liên quan (từ mô hình reranking) và lựa chọn context tối ưu nhất để trả lời câu hỏi y tế.
-
-## NGUYÊN TẮC LỰA CHỌN
-1. **Độ chính xác**: Context phải chứa thông tin chính xác, khoa học về chủ đề được hỏi
-2. **Độ đầy đủ**: Context phải cung cấp đủ thông tin để trả lời hoàn chỉnh câu hỏi
-3. **Độ tin cậy**: Ưu tiên context từ nguồn uy tín, có cơ sở khoa học
-4. **Tính cụ thể**: Context phải cụ thể về cơ chế, liều lượng, cách sử dụng
-5. **Tối ưu số lượng**: Ưu tiên chọn 1 context đầy đủ, chỉ lấy thêm nếu thực sự cần thiết
-
-## THÔNG TIN CONTEXT
-- Tất cả context được hiển thị đầy đủ (không bị cắt bớt)
-- Field "content_length" cho biết độ dài của từng context
-- Có thể phân tích toàn bộ nội dung để đưa ra quyết định chính xác
-
-## DỮ LIỆU ĐẦU VÀO
-
 **CÂU HỎI Y TẾ:**
 {question}
 
 **DANH SÁCH CONTEXT (theo thứ tự ưu tiên từ reranking model):**
 {json.dumps(context_list, ensure_ascii=False, indent=2)}
 
-## YÊU CẦU PHÂN TÍCH
-
-### BƯỚC 1: Đánh giá từng context
-- Xác định mức độ liên quan trực tiếp đến câu hỏi (0-10)
-- Đánh giá độ đầy đủ thông tin (có đủ để trả lời không?)
-- Kiểm tra tính chính xác và cơ sở khoa học
-- Xác định điểm mạnh và điểm yếu của mỗi context
-
-### BƯỚC 2: Lựa chọn context tối ưu
-- Chọn context có điểm tổng hợp cao nhất (không nhất thiết phải top 1)
-- Quyết định có cần kết hợp thêm context khác không
-- Ưu tiên giải pháp tối thiểu (1 context nếu đủ)
-
-### BƯỚC 3: Đưa ra quyết định cuối cùng
-
 ## FORMAT TRẢ LỜI
 Trả về ĐÚNG format JSON sau (không thêm text nào khác):
 
 {{
     "selected_chunk_ids": ["chunk_X", "chunk_Y"],
-    "reasoning": "Phân tích chi tiết: Context chunk_X được chọn vì [lý do cụ thể về độ chính xác, đầy đủ, tin cậy]. [Nếu chọn thêm context khác thì giải thích tại sao cần thiết]",
+    "reasoning": "Phân tích chi tiết",
     "confidence": 0.XX,
     "analysis": {{
         "primary_context": "chunk_X",
         "supplementary_contexts": ["chunk_Y"] hoặc [],
-        "coverage_assessment": "Đánh giá mức độ đủ thông tin để trả lời (đầy đủ/một phần/không đủ)"
+        "coverage_assessment": "Đánh giá mức độ đủ thông tin"
     }}
 }}
-
-**LƯU Ý QUAN TRỌNG:**
-- CHỈ trả về JSON, không có text giải thích thêm
-- Confidence score phải phản ánh chính xác mức độ tin tưởng vào lựa chọn
-- Reasoning phải cụ thể và có căn cứ khoa học
 """
         
         response = azure_client.chat.completions.create(
@@ -216,22 +213,13 @@ def llm_generate_answer(question: str, selected_contexts: List[dict]) -> str:
 # NHIỆM VỤ: TRẢ LỜI CÂU HỎI Y TẾ DỰA TRÊN CONTEXT
 
 ## VAI TRÒ VÀ CHUYÊN MÔN
-Bạn là một chuyên gia y tế đa lĩnh vực với kiến thức sâu về:
-- **Y học lâm sàng**: Chẩn đoán, điều trị, theo dõi bệnh nhân
-- **Dược học**: Cơ chế tác dụng, tương tác thuốc, liều lượng, tác dụng phụ
-- **Thảo dược**: Thành phần hoạt tính, công dụng, cách chế biến và sử dụng
-- **Sinh lý bệnh**: Cơ chế phát sinh và tiến triển bệnh
-- **Y học phòng chống**: Biện pháp phòng ngừa và chăm sóc sức khỏe
-- **Y học cổ truyền**: Phương pháp điều trị truyền thống có cơ sở khoa học
+Bạn là một chuyên gia y tế đa lĩnh vực với kiến thức sâu về y học lâm sàng, dược học, thảo dược, sinh lý bệnh.
 
 ## NGUYÊN TẮC TRẢ LỜI
 1. **Chính xác khoa học**: Thông tin phải có cơ sở khoa học rõ ràng
 2. **Dựa trên context**: Chỉ sử dụng thông tin có trong context được cung cấp
 3. **NGẮN GỌN TỐI ĐA**: 20-80 từ, ưu tiên 30-50 từ
 4. **Trực tiếp**: Trả lời thẳng vào vấn đề, không dài dòng
-5. **Thực tiễn**: Cung cấp thông tin cốt lõi nhất
-
-## DỮ LIỆU ĐẦU VÀO
 
 **CÂU HỎI CẦN TRẢ LỜI:**
 {question}
@@ -239,32 +227,13 @@ Bạn là một chuyên gia y tế đa lĩnh vực với kiến thức sâu về
 **CONTEXT THAM KHẢO:**
 {context_text}
 
-## YÊU CẦU CỤ THỂ
-
-### Cấu trúc câu trả lời (NGẮN GỌN):
-1. **Trả lời trực tiếp** trong 1-2 câu chính
-2. **Thông tin cốt lõi** (cơ chế/liều lượng/cách dùng) nếu có trong context
-3. **Lưu ý quan trọng** (nếu cần thiết)
-
-### Tiêu chuẩn chất lượng:
-- **Độ dài**: Không quá dài (tối ưu 30-50 từ)
-- **Ngôn ngữ**: Tiếng Việt súc tích, khoa học
-- **Cấu trúc**: Trực tiếp, không giải thích dài dòng
-- **Nội dung**: Chỉ thông tin thiết yếu nhất
-
-### Lưu ý đặc biệt:
-- KHÔNG bịa đặt thông tin không có trong context
-- KHÔNG giải thích chi tiết nếu không cần thiết
-- Ưu tiên thông tin thực tiễn, cụ thể
-- Sử dụng "theo tài liệu" khi cần thiết
-
 ## TRẢ LỜI (NGẮN GỌN):
 """
         
         response = azure_client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "Bạn là chuyên gia y tế chuyên trả lời CỰC NGẮN GỌN và CHÍNH XÁC. Chỉ nói những gì cần thiết nhất."},
+                {"role": "system", "content": "Bạn là chuyên gia y tế chuyên trả lời CỰC NGẮN GỌN và CHÍNH XÁC."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1,
@@ -278,12 +247,12 @@ Bạn là một chuyên gia y tế đa lĩnh vực với kiến thức sâu về
         context_preview = selected_contexts[0]['content'][:300] if selected_contexts else ""
         return f"Dựa trên thông tin tìm được: {context_preview}..."
 
-
 def search_initial_context_node(state: GraphState) -> GraphState:
     question = state.get("question")
     
     try:
-        query_embedding = context_embedding_model.embed_query(question)
+        # Use Modal API for context embedding
+        query_embedding = get_context_embedding(question)
         results = context_store.similarity_search_with_score(query_embedding=query_embedding, k=10)
         
         if not results:
@@ -312,7 +281,8 @@ def rerank_context_node(state: GraphState) -> GraphState:
         return state
     
     try:
-        reranked_chunks = rerank_documents(question, initial_chunks, top_k=5)
+        # Use Modal API for reranking
+        reranked_chunks = rerank_documents_api(question, initial_chunks, top_k=5)
         return {**state, "reranked_chunks": reranked_chunks}
         
     except Exception as e:
@@ -349,8 +319,9 @@ def search_image_node(state: GraphState) -> GraphState:
         return state
     
     try:
+        # Use Modal API for image embedding
         main_context = selected_contexts[0]['content']
-        context_embedding = image_embedding_model.embed_query(main_context)
+        context_embedding = get_image_embedding(main_context)
         results = image_store.similarity_search_with_score(query_embedding=context_embedding, k=1)
         
         if results:
@@ -371,6 +342,7 @@ def search_image_node(state: GraphState) -> GraphState:
         return {**state, "image_info": image_info}
         
     except Exception as e:
+        print(f"Warning: Image search failed: {str(e)}")
         return {**state, "image_info": None}
 
 def finalize_answer_node(state: GraphState) -> GraphState:
@@ -415,3 +387,10 @@ def create_enhanced_rag_graph() -> "CompiledGraph":
     workflow.add_edge("finalize_answer", END)
 
     return workflow.compile()
+
+# Test the updated pipeline
+if __name__ == "__main__":
+    graph = create_enhanced_rag_graph()
+    test_question = "Paracetamol có tác dụng gì?"
+    result = graph.invoke({"question": test_question})
+    print(result["final_answer"])
