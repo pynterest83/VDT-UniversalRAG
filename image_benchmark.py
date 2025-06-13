@@ -55,12 +55,12 @@ class ImageTopKAccuracyBenchmark:
         )
         return [doc.page_content for doc in results]
     
-    def check_context_in_retrieved(self, ground_truth_caption: str, retrieved_contexts: List[str]) -> bool:
-        """Check if ground truth caption appears in retrieved documents"""
+    def check_caption_in_retrieved(self, ground_truth_caption: str, retrieved_captions: List[str]) -> bool:
+        """Check if ground truth caption appears in retrieved captions"""
         normalized_gt = self.normalize_text(ground_truth_caption)
         
-        for retrieved_context in retrieved_contexts:
-            normalized_retrieved = self.normalize_text(retrieved_context)
+        for retrieved_caption in retrieved_captions:
+            normalized_retrieved = self.normalize_text(retrieved_caption)
             
             # Check for exact match
             if normalized_gt == normalized_retrieved:
@@ -83,26 +83,42 @@ class ImageTopKAccuracyBenchmark:
         """Evaluate a single image Q&A sample for top-k accuracy"""
         question = image_qa_item.get('question', '')
         answer = image_qa_item.get('answer', '')
-        caption = image_qa_item.get('caption', '')  # Use caption as ground truth context
+        context = image_qa_item.get('context', '')  # Use context as search query
+        caption = image_qa_item.get('caption', '')  # Use caption as ground truth
         image_filename = image_qa_item.get('image_filename', '')
         
-        if not question or not caption:
-            return {'found': False, 'error': 'Missing question or caption'}
+        if not context or not caption:
+            return {
+                'found': False, 
+                'error': 'Missing context or caption',
+                'context': context,
+                'caption': caption,
+                'image_filename': image_filename
+            }
         
         try:
-            retrieved_contexts = self.retrieve_documents(question, k=k)
-            found = self.check_context_in_retrieved(caption, retrieved_contexts)
+            # Use context as query to search for related captions
+            retrieved_captions = self.retrieve_documents(context, k=k)
+            found = self.check_caption_in_retrieved(caption, retrieved_captions)
             
             return {
                 'found': found,
+                'context': context,  # The search query
+                'ground_truth_caption': caption,  # What we're looking for
                 'question': question,
-                'ground_truth_caption': caption,
+                'answer': answer,
                 'image_filename': image_filename,
-                'retrieved_count': len(retrieved_contexts),
+                'retrieved_count': len(retrieved_captions),
                 'error': None
             }
         except Exception as e:
-            return {'found': False, 'error': str(e)}
+            return {
+                'found': False, 
+                'error': str(e),
+                'context': context,
+                'caption': caption,
+                'image_filename': image_filename
+            }
     
     def calculate_topk_accuracy(self, results: List[Dict[str, Any]]) -> Dict[str, float]:
         """Calculate top-k accuracy metrics"""
@@ -136,6 +152,7 @@ class ImageTopKAccuracyBenchmark:
         
         for k in k_values:
             print(f"\nEvaluating Top-{k} Accuracy...")
+            print(f"Query: Context → Search for: Related Captions → Check: Ground Truth Caption")
             sample_results = []
             
             for image_qa_item in tqdm(image_qa_dataset, desc=f"Evaluating k={k}"):
@@ -147,13 +164,29 @@ class ImageTopKAccuracyBenchmark:
             results[f"top_{k}"] = metrics
             
             print(f"Top-{k} Accuracy: {metrics['accuracy']:.4f} ({metrics['found_count']}/{metrics['total_evaluated']})")
+            
+            # Show some error examples for debugging
+            error_samples = [r for r in sample_results if r.get('error') is not None]
+            if error_samples and k == k_values[0]:  # Only show for first k value
+                print(f"\nError Examples (showing first 3 of {len(error_samples)}):")
+                for i, error_sample in enumerate(error_samples[:3]):
+                    print(f"  Error {i+1}: {error_sample['error']}")
+                    print(f"    Context: {error_sample.get('context', 'N/A')[:100]}...")
+                    print(f"    Caption: {error_sample.get('caption', 'N/A')[:100]}...")
+                    print(f"    Image: {error_sample.get('image_filename', 'N/A')}")
         
         # Prepare final benchmark results
         benchmark_results = {
             'dataset_info': {
                 'total_questions': len(image_qa_dataset),
                 'dataset_path': image_qa_jsonl_path,
-                'dataset_type': 'image_qa_with_captions'
+                'dataset_type': 'image_qa_with_captions',
+                'search_method': 'context_to_caption_retrieval'
+            },
+            'search_explanation': {
+                'query_field': 'context',
+                'target_field': 'caption', 
+                'description': 'Use context as query to find captions, check if ground truth caption is retrieved'
             },
             'topk_accuracy_metrics': results,
             'vector_store_info': {
@@ -179,13 +212,15 @@ def main():
     # Run benchmark on image dataset
     results = benchmark.benchmark(
         image_qa_jsonl_path="datasets/image_question_mappings_test_updated.jsonl",
-        k_values=[1, 5, 10]
+        k_values=[5]
     )
     
     # Print results
     print("\n" + "="*50)
-    print("IMAGE TOP-K ACCURACY BENCHMARK RESULTS")
+    print("IMAGE CAPTION RETRIEVAL BENCHMARK RESULTS")
     print("="*50)
+    print("Search Method: Context → Related Captions")
+    print("Evaluation: Check if ground truth caption is retrieved")
     
     for k_setting, metrics in results['topk_accuracy_metrics'].items():
         k_value = k_setting.replace('top_', '')
@@ -196,7 +231,7 @@ def main():
     
     # Save results
     os.makedirs('results', exist_ok=True)
-    output_path = 'results/image_topk_accuracy_results_bge_m3_image.json'
+    output_path = 'results/image_caption_retrieval_results_bge_m3.json'
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     

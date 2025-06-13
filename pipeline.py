@@ -41,10 +41,10 @@ def initialize_components():
     )
     
     # Vector store cho context (văn bản)
-    context_store = VectorStore(collection_name="universal-rag-precomputed-clean-2")
+    context_store = VectorStore(collection_name="universal-rag-precomputed-enhanced")
     
     # Vector store cho caption/ảnh (giả sử có collection khác cho ảnh)
-    image_store = VectorStore(collection_name="universal-rag-precomputed-clean-2")
+    image_store = VectorStore(collection_name="image-captions-store")
     
     return embedding_model, context_store, image_store
 

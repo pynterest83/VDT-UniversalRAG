@@ -510,9 +510,7 @@ def embed_context_caption_pairs():
     
     # Process all cleaned files
     files_to_process = [
-        "/datasets/image_question_mappings_train_clean.jsonl",
-        "/datasets/image_question_mappings_test_clean.jsonl", 
-        "/datasets/image_question_mappings_val_clean.jsonl"
+        "datasets/enhanced_image_captions.jsonl"
     ]
     
     output_file = str(VOL_MOUNT_PATH / "context_caption_embeddings.jsonl")
