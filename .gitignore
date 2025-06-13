@@ -185,5 +185,7 @@ results/
 bge-m3-v3/
 bge_m3_v2/
 bkcare-v1/
+bge-m3-image/
+bge_m3_reranker/
 build_rerank_dataset.py
 reranker.py

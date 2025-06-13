@@ -11,16 +11,16 @@ from collections import defaultdict
 
 load_dotenv()
 
-class TopKAccuracyBenchmark:
+class ImageTopKAccuracyBenchmark:
     def __init__(self, vector_store: VectorStore):
         self.vector_store = vector_store
         # Create embedding model for query encoding
         self.embedding_model = HuggingFaceEmbeddings(
-            model_name="bge-m3-v3"
+            model_name="bge-m3-image"
         )
     
-    def load_qa_dataset(self, jsonl_path: str) -> List[Dict[str, Any]]:
-        """Load Q&A dataset from JSONL file"""
+    def load_image_qa_dataset(self, jsonl_path: str) -> List[Dict[str, Any]]:
+        """Load image Q&A dataset from JSONL file"""
         qa_data = []
         with open(jsonl_path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -55,9 +55,9 @@ class TopKAccuracyBenchmark:
         )
         return [doc.page_content for doc in results]
     
-    def check_context_in_retrieved(self, ground_truth_context: str, retrieved_contexts: List[str]) -> bool:
-        """Check if ground truth context appears in retrieved documents"""
-        normalized_gt = self.normalize_text(ground_truth_context)
+    def check_context_in_retrieved(self, ground_truth_caption: str, retrieved_contexts: List[str]) -> bool:
+        """Check if ground truth caption appears in retrieved documents"""
+        normalized_gt = self.normalize_text(ground_truth_caption)
         
         for retrieved_context in retrieved_contexts:
             normalized_retrieved = self.normalize_text(retrieved_context)
@@ -79,23 +79,25 @@ class TopKAccuracyBenchmark:
         
         return False
     
-    def evaluate_sample(self, qa_item: Dict[str, Any], k: int = 5) -> Dict[str, Any]:
-        """Evaluate a single Q&A sample for top-k accuracy"""
-        question = qa_item.get('question', '')
-        answer = qa_item.get('answer', '')
-        ground_truth_context = qa_item.get('context', '')
+    def evaluate_sample(self, image_qa_item: Dict[str, Any], k: int = 5) -> Dict[str, Any]:
+        """Evaluate a single image Q&A sample for top-k accuracy"""
+        question = image_qa_item.get('question', '')
+        answer = image_qa_item.get('answer', '')
+        caption = image_qa_item.get('caption', '')  # Use caption as ground truth context
+        image_filename = image_qa_item.get('image_filename', '')
         
-        if not question or not ground_truth_context:
-            return {'found': False, 'error': 'Missing question or context'}
+        if not question or not caption:
+            return {'found': False, 'error': 'Missing question or caption'}
         
         try:
             retrieved_contexts = self.retrieve_documents(question, k=k)
-            found = self.check_context_in_retrieved(ground_truth_context, retrieved_contexts)
+            found = self.check_context_in_retrieved(caption, retrieved_contexts)
             
             return {
                 'found': found,
                 'question': question,
-                'ground_truth_context': ground_truth_context,
+                'ground_truth_caption': caption,
+                'image_filename': image_filename,
                 'retrieved_count': len(retrieved_contexts),
                 'error': None
             }
@@ -124,11 +126,11 @@ class TopKAccuracyBenchmark:
             'error_count': len(results) - len(valid_results)
         }
     
-    def benchmark(self, qa_jsonl_path: str, k_values: List[int] = [1, 3, 5, 10, 20]) -> Dict[str, Any]:
-        """Run top-k accuracy benchmark"""
-        print(f"Loading Q&A dataset from {qa_jsonl_path}...")
-        qa_dataset = self.load_qa_dataset(qa_jsonl_path)
-        print(f"Loaded {len(qa_dataset)} Q&A pairs")
+    def benchmark(self, image_qa_jsonl_path: str, k_values: List[int] = [1, 3, 5, 10, 20]) -> Dict[str, Any]:
+        """Run top-k accuracy benchmark for image Q&A dataset"""
+        print(f"Loading image Q&A dataset from {image_qa_jsonl_path}...")
+        image_qa_dataset = self.load_image_qa_dataset(image_qa_jsonl_path)
+        print(f"Loaded {len(image_qa_dataset)} image Q&A pairs")
         
         results = {}
         
@@ -136,8 +138,8 @@ class TopKAccuracyBenchmark:
             print(f"\nEvaluating Top-{k} Accuracy...")
             sample_results = []
             
-            for qa_item in tqdm(qa_dataset, desc=f"Evaluating k={k}"):
-                result = self.evaluate_sample(qa_item, k=k)
+            for image_qa_item in tqdm(image_qa_dataset, desc=f"Evaluating k={k}"):
+                result = self.evaluate_sample(image_qa_item, k=k)
                 sample_results.append(result)
             
             # Calculate metrics for this k value
@@ -149,8 +151,9 @@ class TopKAccuracyBenchmark:
         # Prepare final benchmark results
         benchmark_results = {
             'dataset_info': {
-                'total_questions': len(qa_dataset),
-                'dataset_path': qa_jsonl_path
+                'total_questions': len(image_qa_dataset),
+                'dataset_path': image_qa_jsonl_path,
+                'dataset_type': 'image_qa_with_captions'
             },
             'topk_accuracy_metrics': results,
             'vector_store_info': {
@@ -166,22 +169,22 @@ def main():
     # Initialize vector store
     print("Initializing Vector Store...")
     vector_store = VectorStore(
-        collection_name="universal-rag-precomputed-enhanced", 
+        collection_name="image-captions-store", 
         delete_existing=False
     )
     
     # Initialize benchmark
-    benchmark = TopKAccuracyBenchmark(vector_store)
+    benchmark = ImageTopKAccuracyBenchmark(vector_store)
     
-    # Run benchmark
+    # Run benchmark on image dataset
     results = benchmark.benchmark(
-        qa_jsonl_path="datasets/q_a_test_filtered.jsonl",
-        k_values=[1, 5]
+        image_qa_jsonl_path="datasets/image_question_mappings_test_updated.jsonl",
+        k_values=[1, 5, 10]
     )
     
     # Print results
     print("\n" + "="*50)
-    print("TOP-K ACCURACY BENCHMARK RESULTS")
+    print("IMAGE TOP-K ACCURACY BENCHMARK RESULTS")
     print("="*50)
     
     for k_setting, metrics in results['topk_accuracy_metrics'].items():
@@ -193,7 +196,7 @@ def main():
     
     # Save results
     os.makedirs('results', exist_ok=True)
-    output_path = 'results/topk_accuracy_results_bge_m3_v3.json'
+    output_path = 'results/image_topk_accuracy_results_bge_m3_image.json'
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     
