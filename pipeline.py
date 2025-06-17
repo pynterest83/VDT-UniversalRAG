@@ -58,37 +58,30 @@ def initialize_components():
 azure_client, image_client, context_store, image_store = initialize_components()
 encoding = tiktoken.encoding_for_model("gpt-4o")
 
-def create_medical_prompt(question_data):
-    keyword = question_data.get('keyword', 'y tế')
-    question = question_data.get('question', '')
-    context = question_data.get('context', '')
-    
-    props_description = f"realistic medical items related to {keyword}, medicine packages, medical documents on desk"
-    
+def create_image_prompt(question: str, context: str, answer: str):
     return f"""
-Create a realistic, professional medical consultation photo about "{keyword}".
+Generate a realistic, high-quality, professional medical image that visually represents the following information. The image should be suitable for a medical consultation or educational material.
 
-Medical context: {question}
-Information: {context}
+**Main Answer to Illustrate:**
+{answer}
 
-Scene requirements:
-- Style: Realistic photography, not illustration or cartoon
-- People: Asian doctor consulting with Asian patient
-- Doctor: Professional attire (white coat), confident and caring expression
-- Patient: Comfortable, attentive, trusting
-- Setting: Modern medical clinic or pharmacy, clean and professional
-- Props: {props_description}, medical documents, computer/tablet
-- Lighting: Natural, warm, professional medical lighting
-- Composition: Clear view of consultation, focused on interaction
-- Quality: High resolution, sharp details
+**Full Context for Detail:**
+- **User's Question:** {question}
+- **Supporting Information:** {context}
 
-Important: NO TEXT visible in the image, no signs with words, focus on realistic medical consultation scene.
+**Guidelines:**
+- **Style**: Realistic photography. Avoid illustrations, cartoons, or abstract art.
+- **Focus**: The main goal is to visually represent the **Main Answer**. Use the question and supporting information to add accurate details.
+- **Clarity**: The image must be clear, professional, and easy to understand.
+- **Setting**: A clean, modern medical environment like a clinic, hospital, or pharmacy.
+- **Important**: Do not include any visible text, logos, or branding in the image. The focus is on the visual representation of the medical information.
+- **Tone**: Professional, trustworthy, and informative.
 
-Photography style: Medical consultation photography, professional healthcare setting.
+Create an image that effectively visualizes the provided medical answer, informed by the original question and context.
 """
 
-def generate_medical_image(question_data):
-    prompt = create_medical_prompt(question_data)
+def generate_medical_image(question: str, context: str, answer: str):
+    prompt = create_image_prompt(question, context, answer)
     os.makedirs("imgs", exist_ok=True)
     
     result = image_client.images.generate(
@@ -112,7 +105,7 @@ def generate_medical_image(question_data):
     return {
         "image_path": full_path,
         "image_name": filename,
-        "caption": f"Ảnh được sinh tự động cho câu hỏi: {question_data.get('question', '')}",
+        "caption": f"Ảnh được sinh tự động cho câu hỏi: {question}",
         "source": "AI Generated",
         "score": 1.0,
         "type": "generated"
@@ -167,16 +160,21 @@ def rerank_documents_api(query: str, documents: List[dict], top_k: int = 5) -> L
         return fallback_docs
 
 def llm_select_context(question: str, ranked_chunks: List[dict]) -> List[dict]:
+    
     if not ranked_chunks:
         return []
     
     try:
         context_list = []
+        total_context_length = 0
+        
         for i, chunk in enumerate(ranked_chunks):
+            content = chunk['content']
+            total_context_length += len(content)
             context_list.append({
                 "priority_order": i + 1,
                 "rerank_score": chunk.get('rerank_score', 0),
-                "content": chunk['content'],
+                "content": content,
                 "chunk_id": chunk.get('chunk_id', f"chunk_{i+1}"),
             })
         
@@ -194,25 +192,62 @@ Bạn là một chuyên gia phân tích thông tin y tế với chuyên môn sâ
 - Sinh lý bệnh và cơ chế bệnh tật
 - Điều trị và phòng ngừa bệnh
 
+## NHIỆM VỤ CỤ THỂ
+Phân tích danh sách context đã được sắp xếp theo độ liên quan (từ mô hình reranking) và lựa chọn context tối ưu nhất để trả lời câu hỏi y tế.
+
+## NGUYÊN TẮC LỰA CHỌN
+1. **Độ chính xác**: Context phải chứa thông tin chính xác, khoa học về chủ đề được hỏi
+2. **Độ đầy đủ**: Context phải cung cấp đủ thông tin để trả lời hoàn chỉnh câu hỏi
+3. **Độ tin cậy**: Ưu tiên context từ nguồn uy tín, có cơ sở khoa học
+4. **Tính cụ thể**: Context phải cụ thể về cơ chế, liều lượng, cách sử dụng
+5. **Tối ưu số lượng**: Ưu tiên chọn 1 context đầy đủ, chỉ lấy thêm nếu thực sự cần thiết
+
+## THÔNG TIN CONTEXT
+- Tất cả context được hiển thị đầy đủ (không bị cắt bớt)
+- Field "content_length" cho biết độ dài của từng context
+- Có thể phân tích toàn bộ nội dung để đưa ra quyết định chính xác
+
+## DỮ LIỆU ĐẦU VÀO
+
 **CÂU HỎI Y TẾ:**
 {question}
 
 **DANH SÁCH CONTEXT (theo thứ tự ưu tiên từ reranking model):**
 {json.dumps(context_list, ensure_ascii=False, indent=2)}
 
+## YÊU CẦU PHÂN TÍCH
+
+### BƯỚC 1: Đánh giá từng context
+- Xác định mức độ liên quan trực tiếp đến câu hỏi (0-10)
+- Đánh giá độ đầy đủ thông tin (có đủ để trả lời không?)
+- Kiểm tra tính chính xác và cơ sở khoa học
+- Xác định điểm mạnh và điểm yếu của mỗi context
+
+### BƯỚC 2: Lựa chọn context tối ưu
+- Chọn context có điểm tổng hợp cao nhất (không nhất thiết phải top 1)
+- Quyết định có cần kết hợp thêm context khác không
+- Ưu tiên giải pháp tối thiểu (1 context nếu đủ)
+
+### BƯỚC 3: Đưa ra quyết định cuối cùng
+
 ## FORMAT TRẢ LỜI
 Trả về ĐÚNG format JSON sau (không thêm text nào khác):
 
 {{
     "selected_chunk_ids": ["chunk_X", "chunk_Y"],
-    "reasoning": "Phân tích chi tiết",
+    "reasoning": "Phân tích chi tiết: Context chunk_X được chọn vì [lý do cụ thể về độ chính xác, đầy đủ, tin cậy]. [Nếu chọn thêm context khác thì giải thích tại sao cần thiết]",
     "confidence": 0.XX,
     "analysis": {{
         "primary_context": "chunk_X",
         "supplementary_contexts": ["chunk_Y"] hoặc [],
-        "coverage_assessment": "Đánh giá mức độ đủ thông tin"
+        "coverage_assessment": "Đánh giá mức độ đủ thông tin để trả lời (đầy đủ/một phần/không đủ)"
     }}
 }}
+
+**LƯU Ý QUAN TRỌNG:**
+- CHỈ trả về JSON, không có text giải thích thêm
+- Confidence score phải phản ánh chính xác mức độ tin tưởng vào lựa chọn
+- Reasoning phải cụ thể và có căn cứ khoa học
 """
         
         response = azure_client.chat.completions.create(
@@ -226,38 +261,54 @@ Trả về ĐÚNG format JSON sau (không thêm text nào khác):
             response_format={"type": "json_object"}
         )
         
-        result = json.loads(response.choices[0].message.content.strip())
-        selected_chunk_ids = result.get("selected_chunk_ids", [])
+        result_text = response.choices[0].message.content.strip()
         
-        selected_contexts = []
-        for chunk_id in selected_chunk_ids:
-            for chunk in ranked_chunks:
-                if chunk.get('chunk_id') == chunk_id:
-                    selected_contexts.append(chunk)
-                    break
-        
-        return selected_contexts
+        try:
+            result = json.loads(result_text)
+            selected_chunk_ids = result.get("selected_chunk_ids", [])
             
-    except Exception:
-        return [ranked_chunks[0]]
+            selected_contexts = []
+            for chunk_id in selected_chunk_ids:
+                for chunk in ranked_chunks:
+                    if chunk.get('chunk_id') == chunk_id:
+                        selected_contexts.append(chunk)
+                        break
+            
+            return selected_contexts
+            
+        except json.JSONDecodeError:
+            return [ranked_chunks[0]]
+        
+    except Exception as e:
+        return [ranked_chunks[0]] if ranked_chunks else []
 
 def llm_generate_answer(question: str, selected_contexts: List[dict]) -> str:
     if not selected_contexts:
         return "Xin lỗi, tôi không tìm thấy thông tin liên quan để trả lời câu hỏi này."
     
-    context_text = "\n\n".join([f"Context {i+1}:\n{ctx['content']}" for i, ctx in enumerate(selected_contexts)])
-    
-    prompt = f"""
+    try:
+        context_text = "\n\n".join([f"Context {i+1}:\n{ctx['content']}" for i, ctx in enumerate(selected_contexts)])
+        
+        prompt = f"""
 # NHIỆM VỤ: TRẢ LỜI CÂU HỎI Y TẾ DỰA TRÊN CONTEXT
 
 ## VAI TRÒ VÀ CHUYÊN MÔN
-Bạn là một chuyên gia y tế đa lĩnh vực với kiến thức sâu về y học lâm sàng, dược học, thảo dược, sinh lý bệnh.
+Bạn là một chuyên gia y tế đa lĩnh vực với kiến thức sâu về:
+- **Y học lâm sàng**: Chẩn đoán, điều trị, theo dõi bệnh nhân
+- **Dược học**: Cơ chế tác dụng, tương tác thuốc, liều lượng, tác dụng phụ
+- **Thảo dược**: Thành phần hoạt tính, công dụng, cách chế biến và sử dụng
+- **Sinh lý bệnh**: Cơ chế phát sinh và tiến triển bệnh
+- **Y học phòng chống**: Biện pháp phòng ngừa và chăm sóc sức khỏe
+- **Y học cổ truyền**: Phương pháp điều trị truyền thống có cơ sở khoa học
 
 ## NGUYÊN TẮC TRẢ LỜI
 1. **Chính xác khoa học**: Thông tin phải có cơ sở khoa học rõ ràng
 2. **Dựa trên context**: Chỉ sử dụng thông tin có trong context được cung cấp
 3. **NGẮN GỌN TỐI ĐA**: 20-80 từ, ưu tiên 30-50 từ
 4. **Trực tiếp**: Trả lời thẳng vào vấn đề, không dài dòng
+5. **Thực tiễn**: Cung cấp thông tin cốt lõi nhất
+
+## DỮ LIỆU ĐẦU VÀO
 
 **CÂU HỎI CẦN TRẢ LỜI:**
 {question}
@@ -265,20 +316,44 @@ Bạn là một chuyên gia y tế đa lĩnh vực với kiến thức sâu về
 **CONTEXT THAM KHẢO:**
 {context_text}
 
+## YÊU CẦU CỤ THỂ
+
+### Cấu trúc câu trả lời (NGẮN GỌN):
+1. **Trả lời trực tiếp** trong 1-2 câu chính
+2. **Thông tin cốt lõi** (cơ chế/liều lượng/cách dùng) nếu có trong context
+3. **Lưu ý quan trọng** (nếu cần thiết)
+
+### Tiêu chuẩn chất lượng:
+- **Độ dài**: Không quá dài (tối ưu 30-50 từ)
+- **Ngôn ngữ**: Tiếng Việt súc tích, khoa học
+- **Cấu trúc**: Trực tiếp, không giải thích dài dòng
+- **Nội dung**: Chỉ thông tin thiết yếu nhất
+
+### Lưu ý đặc biệt:
+- KHÔNG bịa đặt thông tin không có trong context
+- KHÔNG giải thích chi tiết nếu không cần thiết
+- Ưu tiên thông tin thực tiễn, cụ thể
+- Sử dụng "theo tài liệu" khi cần thiết
+
 ## TRẢ LỜI (NGẮN GỌN):
 """
-    
-    response = azure_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": "Bạn là chuyên gia y tế chuyên trả lời CỰC NGẮN GỌN và CHÍNH XÁC."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.1,
-        max_tokens=300
-    )
-    
-    return response.choices[0].message.content.strip()
+        
+        response = azure_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "Bạn là chuyên gia y tế chuyên trả lời CỰC NGẮN GỌN và CHÍNH XÁC. Chỉ nói những gì cần thiết nhất."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            max_tokens=300
+        )
+        
+        answer = response.choices[0].message.content.strip()
+        return answer
+        
+    except Exception as e:
+        context_preview = selected_contexts[0]['content'][:300] if selected_contexts else ""
+        return f"Dựa trên thông tin tìm được: {context_preview}..."
 
 def search_initial_context_node(state: GraphState) -> GraphState:
     question = state.get("question")
@@ -366,36 +441,15 @@ def generate_image_node(state: GraphState) -> GraphState:
     
     question = state.get("question")
     selected_contexts = state.get("selected_contexts", [])
-    
+    answer = state.get("answer")
+
+    if not answer:
+        return {**state, "error": "Không có câu trả lời để tạo ảnh."}
+
     main_context = selected_contexts[0]['content'] if selected_contexts else ""
     
-    question_data = {
-        "question": question,
-        "context": main_context,
-        "keyword": extract_keyword_from_question(question),
-    }
-    
-    generated_image = generate_medical_image(question_data)
+    generated_image = generate_medical_image(question, main_context, answer)
     return {**state, "generated_image": generated_image}
-
-def extract_keyword_from_question(question: str) -> str:
-    question_lower = question.lower()
-    
-    medical_keywords = [
-        "paracetamol", "aspirin", "vitamin", "thuốc", "bệnh", "điều trị",
-        "carbogast", "calcium", "dược", "y tế", "sức khỏe"
-    ]
-    
-    for keyword in medical_keywords:
-        if keyword in question_lower:
-            return keyword
-    
-    words = question.split()
-    for word in words:
-        if len(word) > 3 and word.lower() not in ["trong", "của", "với", "như", "thế", "nào"]:
-            return word
-    
-    return "y tế"
 
 def finalize_answer_node(state: GraphState) -> GraphState:
     answer = state.get("answer")
@@ -433,9 +487,9 @@ def create_enhanced_rag_graph() -> "CompiledGraph":
     workflow.set_entry_point("search_initial_context")
     workflow.add_edge("search_initial_context", "rerank_context")
     workflow.add_edge("rerank_context", "select_context")
-    workflow.add_edge("select_context", "generate_answer")
-    workflow.add_edge("generate_answer", "search_images")
-    workflow.add_edge("search_images", "finalize_answer")
+    workflow.add_edge("select_context", "search_images")
+    workflow.add_edge("search_images", "generate_answer")
+    workflow.add_edge("generate_answer", "finalize_answer")
 
     return workflow.compile()
 
