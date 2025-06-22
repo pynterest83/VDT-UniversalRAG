@@ -44,7 +44,7 @@ app = modal.App(name="bge-m3-image-vietnamese-reranker-benchmark", image=image)
 class VectorStore: 
     def __init__(self, collection_name: str = "image-captions-store", delete_existing: bool = False):
         # Login to Hugging Face first
-        login(token="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")
+        login(token=os.getenv("HF_TOKEN"))
         
         # Use the local uploaded image model
         self.embedding_model = HuggingFaceEmbeddings(
@@ -602,11 +602,3 @@ def run_complete_benchmark():
     
     print("\n✅ Caption retrieval comparison benchmark completed successfully!")
     return results
-
-
-# CLI Usage Examples:
-# To run the comparison benchmark:
-# modal run benchmark_reranker.py::run_complete_benchmark
-
-# To run just the comparison benchmark function:
-# modal run benchmark_reranker.py::run_benchmark_comparison
