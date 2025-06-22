@@ -473,6 +473,24 @@ def finalize_answer_node(state: GraphState) -> GraphState:
     
     return {**state, "final_answer": final_answer}
 
+def create_app_rag_graph() -> "CompiledGraph":
+    """Create RAG graph optimized for app usage - stops after generating answer and finding images"""
+    workflow = StateGraph(GraphState)
+
+    workflow.add_node("search_initial_context", search_initial_context_node)
+    workflow.add_node("rerank_context", rerank_context_node)
+    workflow.add_node("select_context", select_context_node)
+    workflow.add_node("search_images", search_images_node)
+    workflow.add_node("generate_answer", generate_answer_node)
+
+    workflow.set_entry_point("search_initial_context")
+    workflow.add_edge("search_initial_context", "rerank_context")
+    workflow.add_edge("rerank_context", "select_context")
+    workflow.add_edge("select_context", "search_images")
+    workflow.add_edge("search_images", "generate_answer")
+
+    return workflow.compile()
+
 def create_enhanced_rag_graph() -> "CompiledGraph":
     workflow = StateGraph(GraphState)
 

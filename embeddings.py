@@ -5,10 +5,8 @@ import hashlib
 
 VOL_MOUNT_PATH = Path("/vol")
 
-# BAAI/bge-m3 base model for embedding finetuning (1024 dimensions)
 BASE_MODEL = "BAAI/bge-m3"
 
-# Define the Modal image with all necessary dependencies
 image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "torch",
     "tensorboard", 
@@ -25,8 +23,6 @@ image = modal.Image.debian_slim(python_version="3.12").pip_install(
 app = modal.App(name="bge-m3-medical-embeddings", image=image)
 output_vol = modal.Volume.from_name("embeddings-volume", create_if_missing=True)
 
-# ### Handling preemption for long-running training jobs
-
 restart_tracker_dict = modal.Dict.from_name(
     "embeddings-restart-tracker", create_if_missing=True
 )
@@ -42,7 +38,6 @@ def track_restarts(restart_tracker: modal.Dict) -> int:
         restart_tracker["count"] = preemption_count
     return preemption_count
 
-# ## Data loading and preparation functions
 
 def load_jsonl_file(file_path: str):
     """Load data from a JSONL file"""
@@ -93,8 +88,6 @@ def deduplicate_corpus_for_evaluation(corpus_data):
     
     return unique_corpus
 
-# ## Finetuning BAAI/bge-m3 on Vietnamese Medical QA dataset
-
 @app.function(
     gpu="A100",
     volumes={VOL_MOUNT_PATH: output_vol},
@@ -128,7 +121,6 @@ def finetune_embeddings(
     
     print("Loading FULL training data from JSONL files...")
     
-    # Load ALL data from JSONL files (no sample limiting)
     train_data = load_jsonl_file("/datasets/q_a_train_filtered.jsonl")
     test_data = load_jsonl_file("/datasets/q_a_test_filtered.jsonl")
     validation_data = load_jsonl_file("/datasets/q_a_validation_filtered.jsonl")
@@ -137,12 +129,10 @@ def finetune_embeddings(
     print(f"Loaded {len(test_data)} test samples from JSONL (FULL DATASET)")
     print(f"Loaded {len(validation_data)} validation samples from JSONL (FULL DATASET)")
     
-    # Prepare data for training - GIỮ NGUYÊN tất cả samples
     prepared_train = prepare_data_for_training(train_data)
     prepared_test = prepare_data_for_training(test_data)
     prepared_validation = prepare_data_for_training(validation_data)
     
-    # Convert to datasets - FULL training data
     train_dataset = Dataset.from_list(prepared_train)
     test_dataset = Dataset.from_list(prepared_test)
     validation_dataset = Dataset.from_list(prepared_validation)
@@ -151,7 +141,6 @@ def finetune_embeddings(
     print(f"Prepared {len(test_dataset)} test samples (FULL DATASET)")
     print(f"Prepared {len(validation_dataset)} validation samples (FULL DATASET)")
     
-    # Sample data structure for verification
     if train_dataset:
         sample = train_dataset[0]
         print(f"\nSample training data:")
@@ -159,17 +148,13 @@ def finetune_embeddings(
         print(f"Question: {sample['anchor'][:100]}...")
         print(f"Context: {sample['positive'][:100]}...")
     
-    # CHỈ deduplicate cho evaluation corpus
     all_data = prepared_train + prepared_validation + prepared_test
     corpus_dataset = Dataset.from_list(all_data)
     
-    # Tạo corpus RAW (có duplicates) 
     corpus_raw = dict(zip(corpus_dataset["id"], corpus_dataset["positive"]))
     
-    # CHỈ deduplicate cho evaluation
     corpus = deduplicate_corpus_for_evaluation(corpus_raw)
     
-    # Helper function to build relevant_docs mapping
     def build_relevant_docs(dataset, corpus_raw, corpus):
         """Build relevant docs mapping handling deduplication correctly"""
         queries = dict(zip(dataset["id"], dataset["anchor"]))
@@ -541,14 +526,3 @@ def embed_chunked_corpus():
     
     output_vol.commit()
     return output_file
-
-# ## CLI Usage Examples
-
-# To start finetuning:
-# modal run --detach embeddings.py::finetune_embeddings --num-train-epochs=4
-
-# To monitor training with tensorboard:
-# Visit: https://ise703--bge-m3-medical-embeddings-monitor-dev.modal.run
-
-# To test inference with real data:
-# modal run embeddings.py

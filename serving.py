@@ -5,10 +5,8 @@ import uuid
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 
-# Create Modal volumes for storing models
 models_volume = modal.Volume.from_name("rag-models", create_if_missing=True)
 
-# Create Modal image for embedding models (bge-m3-v3 and bge-m3-image)
 embedding_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install([
@@ -23,14 +21,13 @@ embedding_image = (
     ])
 )
 
-# Create Modal image for reranker model - ADD SENTENCEPIECE
 reranker_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install([
         "torch>=2.0.0",
         "transformers>=4.30.0",
-        "sentencepiece>=0.1.99",  # Add this for XLMRoberta tokenizer
-        "protobuf>=3.20.0",      # Required for sentencepiece
+        "sentencepiece>=0.1.99",
+        "protobuf>=3.20.0",
         "numpy>=1.24.0",
         "scikit-learn>=1.3.0",
         "accelerate>=0.20.0",
@@ -38,7 +35,6 @@ reranker_image = (
     ])
 )
 
-# Create Modal image for main API and pipeline orchestration
 api_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install([
@@ -51,7 +47,6 @@ api_image = (
 
 app = modal.App("universal-rag-models")
 
-# Pydantic models for API requests
 class EmbeddingRequest(BaseModel):
     text: str
 
@@ -60,9 +55,7 @@ class RerankRequest(BaseModel):
     documents: List[Dict[str, Any]]
     top_k: Optional[int] = 5
 
-# Helper function to find correct model path
 def find_model_path(base_dir: str, model_name: str) -> str:
-    """Find the correct model path, handling different upload structures"""
     import os
     
     possible_paths = [
@@ -78,7 +71,6 @@ def find_model_path(base_dir: str, model_name: str) -> str:
     
     raise FileNotFoundError(f"Model {model_name} not found in any of: {possible_paths}")
 
-# --- Context Embedding Model Endpoint (bge-m3-v3) ---
 @app.function(
     image=embedding_image,
     gpu="T4",
@@ -92,7 +84,6 @@ def embed_context(request: EmbeddingRequest):
     import torch  # Import torch here where it's needed
     from langchain_huggingface import HuggingFaceEmbeddings
     
-    # Initialize the model from local path (cached after first load)
     if not hasattr(embed_context, "model"):
         try:
             model_path = find_model_path("/models", "bge-m3-v3")
@@ -119,7 +110,6 @@ def embed_context(request: EmbeddingRequest):
     except Exception as e:
         return {"error": f"Context embedding error: {str(e)}"}
 
-# --- Image Embedding Model Endpoint (bge-m3-image) ---
 @app.function(
     image=embedding_image,
     gpu="T4",
@@ -133,7 +123,6 @@ def embed_image_caption(request: EmbeddingRequest):
     import torch  # Import torch here where it's needed
     from langchain_huggingface import HuggingFaceEmbeddings
     
-    # Initialize the model from local path (cached after first load)
     if not hasattr(embed_image_caption, "model"):
         try:
             model_path = find_model_path("/models", "bge-m3-image")
@@ -160,7 +149,6 @@ def embed_image_caption(request: EmbeddingRequest):
     except Exception as e:
         return {"error": f"Image embedding error: {str(e)}"}
 
-# --- Reranker Model Endpoint (bge_m3_reranker) ---
 @app.function(
     image=reranker_image,
     gpu="T4",
@@ -174,7 +162,6 @@ def rerank_documents(request: RerankRequest):
     import torch  # Import torch here where it's needed
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
     
-    # Initialize the model from local path (cached after first load)
     if not hasattr(rerank_documents, "tokenizer") or not hasattr(rerank_documents, "model"):
         try:
             model_path = find_model_path("/models", "bge_m3_reranker")
@@ -330,7 +317,6 @@ def test_all_models():
     
     results = {}
     
-    # Get the current deployment URLs
     base_url = "https://ise703--universal-rag-models"
     
     try:
