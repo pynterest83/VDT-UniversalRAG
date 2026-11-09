@@ -494,7 +494,7 @@ def main():
     
     # Define example questions from the test file
     example_questions = [
-        "Có bắt buộc phải sử dụng thuốc Carbogast trong khi mang thai và cho con bú không?",
+        "Hoa của cây Phèn đen có đặc điểm gì?",
         "Ngoài giảm đau, Acepron 250 mg còn có thêm tác dụng nào khác?",
         "Uống thuốc Comiaryl đúng cách như thế nào?"
     ]
@@ -504,7 +504,7 @@ def main():
     
     with col1:
         if st.button(
-            "🤰 Thuốc Carbogast\nvà thai kỳ", 
+            "🌺 Hoa của cây Phèn đen", 
             key="example_1",
             help="Click để tự động gửi câu hỏi",
             use_container_width=True

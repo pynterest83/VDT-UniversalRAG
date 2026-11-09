@@ -75,8 +75,8 @@ def find_model_path(base_dir: str, model_name: str) -> str:
     image=embedding_image,
     gpu="T4",
     volumes={"/models": models_volume},
-    scaledown_window=300,
-    timeout=120
+    scaledown_window=3600,  # 1 hour
+    timeout=300             # 5 minutes
 )
 @modal.fastapi_endpoint(method="POST")
 def embed_context(request: EmbeddingRequest):
@@ -114,8 +114,8 @@ def embed_context(request: EmbeddingRequest):
     image=embedding_image,
     gpu="T4",
     volumes={"/models": models_volume},
-    scaledown_window=300,
-    timeout=120
+    scaledown_window=3600,  # 1 hour
+    timeout=300             # 5 minutes
 )
 @modal.fastapi_endpoint(method="POST")
 def embed_image_caption(request: EmbeddingRequest):
@@ -153,8 +153,8 @@ def embed_image_caption(request: EmbeddingRequest):
     image=reranker_image,
     gpu="T4",
     volumes={"/models": models_volume},
-    scaledown_window=300,
-    timeout=240
+    scaledown_window=3600,  # 1 hour
+    timeout=600             # 10 minutes
 )
 @modal.fastapi_endpoint(method="POST")
 def rerank_documents(request: RerankRequest):
